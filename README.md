@@ -81,6 +81,4 @@ Painel com informações importantes:
 - bcrypt
 - PyInstaller
 
----
 
-# Estrutura do projeto
