@@ -1,0 +1,181 @@
+/* ===================================================
+   MEDCONTRACT — GLOBAL THEME
+   Versão profissional refinada
+   =================================================== */
+
+
+/* ===== Janela principal ===== */
+
+QMainWindow {
+    background-color: #eef2f7;
+}
+
+
+/* ===== Base geral (SEM forçar fundo global!) ===== */
+
+QWidget {
+    font-family: "Segoe UI";
+    color: #0f172a;
+    background: transparent;
+}
+
+
+/* ===== Labels ===== */
+
+QLabel {
+    background: transparent;
+}
+
+
+/* ===== Botões padrão ===== */
+
+QPushButton {
+    background-color: #2b6c7e;
+    color: white;
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-weight: 600;
+    border: none;
+}
+
+QPushButton:hover {
+    background-color: #327c92;
+}
+
+QPushButton:pressed {
+    background-color: #255d6c;
+}
+
+QPushButton:disabled {
+    background-color: #cbd5e1;
+    color: #64748b;
+}
+
+
+/* ===== Botão secundário pequeno ===== */
+
+QPushButton#btnSecondarySmall {
+    background-color: white;
+    color: #0f172a;
+    border: 1px solid rgba(15, 23, 42, 0.12);
+}
+
+QPushButton#btnSecondarySmall:hover {
+    background-color: #f8fafc;
+}
+
+
+/* ===== Inputs ===== */
+
+QLineEdit {
+    background: white;
+    border: 1px solid rgba(15, 23, 42, 0.15);
+    border-radius: 10px;
+    padding: 6px 10px;
+}
+
+QLineEdit:focus {
+    border: 1px solid #2b6c7e;
+}
+
+
+/* ===== ComboBox ===== */
+
+QComboBox {
+    background: white;
+    border: 1px solid rgba(15, 23, 42, 0.15);
+    border-radius: 10px;
+    padding: 6px 10px;
+}
+
+QComboBox:focus {
+    border: 1px solid #2b6c7e;
+}
+
+
+/* ===== Tabelas ===== */
+
+QTableWidget {
+    background-color: white;
+    border: 1px solid rgba(15, 23, 42, 0.08);
+    gridline-color: rgba(15, 23, 42, 0.05);
+    border-radius: 12px;
+}
+
+QTableWidget::item:selected {
+    background-color: rgba(43, 108, 126, 0.12);
+    color: #0f172a;
+}
+
+QHeaderView::section {
+    background-color: #f1f5f9;
+    padding: 6px;
+    border: none;
+    font-weight: 600;
+    color: #334155;
+}
+
+
+/* ===== Scrollbar moderna ===== */
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 8px;
+    margin: 4px;
+}
+
+QScrollBar::handle:vertical {
+    background: rgba(15, 23, 42, 0.25);
+    border-radius: 4px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: rgba(15, 23, 42, 0.45);
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 8px;
+    margin: 4px;
+}
+
+QScrollBar::handle:horizontal {
+    background: rgba(15, 23, 42, 0.25);
+    border-radius: 4px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: rgba(15, 23, 42, 0.45);
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+
+
+/* ===== Mensagens / Dialogs ===== */
+
+QMessageBox {
+    background-color: #ffffff;
+}
+
+QMessageBox QLabel {
+    color: #0f172a;
+}
+
+
+/* ===== Tooltips ===== */
+
+QToolTip {
+    background-color: #0f172a;
+    color: white;
+    padding: 6px;
+    border-radius: 6px;
+    font-size: 11px;
+}

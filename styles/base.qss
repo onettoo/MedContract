@@ -1,0 +1,187 @@
+/* Global visual system */
+QWidget {
+    font-family: "Segoe UI", "SF Pro Display", "Helvetica Neue", sans-serif;
+    color: #0f172a;
+}
+
+QFrame#card, QFrame#cardBlock, QFrame#sideCard {
+    background: rgba(255,255,255,0.94);
+    border: 1px solid rgba(15,23,42,0.10);
+    border-radius: 16px;
+}
+
+QFrame#softLine, QFrame#divider {
+    background: rgba(15,23,42,0.08);
+    border: none;
+}
+
+QLabel#title {
+    font-size: 22px;
+    font-weight: 900;
+    color: #0f172a;
+}
+
+QLabel#subtitle {
+    font-size: 12px;
+    font-weight: 700;
+    color: #64748b;
+}
+
+QLabel#fieldLabel {
+    font-size: 12px;
+    font-weight: 800;
+    color: #334155;
+}
+
+QLabel#fieldError {
+    font-size: 11px;
+    font-weight: 700;
+    color: #c0392b;
+}
+
+QLineEdit#fieldInput,
+QLineEdit#fieldInputReadOnly,
+QLineEdit#moneyInput {
+    border: 1px solid rgba(15,23,42,0.14);
+    border-radius: 10px;
+    padding-left: 10px;
+    font-size: 13px;
+    background: white;
+    color: #0f172a;
+    selection-background-color: rgba(43,108,126,0.18);
+}
+
+QLineEdit#fieldInput:focus,
+QLineEdit#moneyInput:focus {
+    border: 1px solid rgba(43,108,126,0.72);
+}
+
+QLineEdit#fieldInput[error="true"],
+QLineEdit#moneyInput[error="true"] {
+    border: 1px solid rgba(231,76,60,0.70);
+    background: rgba(231,76,60,0.05);
+}
+
+QLineEdit#fieldInputReadOnly {
+    background: rgba(15,23,42,0.03);
+    font-weight: 900;
+}
+
+QComboBox#saasCombo,
+QComboBox#pillCombo,
+QComboBox#filterCombo,
+QComboBox#monthCombo,
+QComboBox#yearCombo,
+QSpinBox#pillSpin {
+    border: 1px solid rgba(15,23,42,0.12);
+    border-radius: 12px;
+    padding: 0 34px 0 12px;
+    font-size: 13px;
+    font-weight: 800;
+    background: white;
+    color: #0f172a;
+    min-height: 40px;
+}
+
+QComboBox#saasCombo:focus,
+QComboBox#pillCombo:focus,
+QComboBox#filterCombo:focus,
+QComboBox#monthCombo:focus,
+QComboBox#yearCombo:focus,
+QSpinBox#pillSpin:focus {
+    border: 1px solid rgba(43,108,126,0.72);
+}
+
+QComboBox#saasCombo::drop-down,
+QComboBox#pillCombo::drop-down,
+QComboBox#filterCombo::drop-down,
+QComboBox#monthCombo::drop-down,
+QComboBox#yearCombo::drop-down {
+    width: 32px;
+    border: none;
+    background: transparent;
+}
+
+QComboBox#saasCombo::down-arrow,
+QComboBox#pillCombo::down-arrow,
+QComboBox#filterCombo::down-arrow,
+QComboBox#monthCombo::down-arrow,
+QComboBox#yearCombo::down-arrow {
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid rgba(15,23,42,0.55);
+}
+
+QPushButton#btnPrimary {
+    background: #2b6c7e;
+    color: white;
+    border: 1px solid rgba(255,255,255,0.22);
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-weight: 900;
+}
+QPushButton#btnPrimary:hover { background: #2f768a; }
+QPushButton#btnPrimary:pressed { background: #245c6c; }
+QPushButton#btnPrimary:disabled {
+    background: rgba(43,108,126,0.35);
+    color: rgba(255,255,255,0.85);
+}
+
+QPushButton#btnSecondary {
+    background: rgba(255,255,255,0.88);
+    border: 1px solid rgba(15,23,42,0.12);
+    border-radius: 10px;
+    padding: 6px 12px;
+    font-weight: 900;
+    color: #0f172a;
+}
+QPushButton#btnSecondary:hover { background: rgba(255,255,255,1.0); }
+
+QPushButton#btnDanger {
+    background: rgba(231,76,60,0.10);
+    border: 1px solid rgba(231,76,60,0.25);
+    border-radius: 10px;
+    padding: 6px 12px;
+    font-weight: 900;
+    color: #b91c1c;
+}
+QPushButton#btnDanger:hover { background: rgba(231,76,60,0.16); }
+
+QLabel#inlineMessage {
+    background-color: rgba(231,76,60,0.10);
+    border: 1px solid rgba(231,76,60,0.25);
+    color: #c0392b;
+    padding: 10px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 800;
+}
+
+QLabel#inlineMessage[ok="true"] {
+    background-color: rgba(46,204,113,0.10);
+    border: 1px solid rgba(46,204,113,0.25);
+    color: #1e824c;
+}
+
+QTableWidget#table {
+    border: 1px solid rgba(15,23,42,0.10);
+    border-radius: 14px;
+    background: white;
+    gridline-color: rgba(15,23,42,0.06);
+    font-size: 12px;
+}
+
+QTableWidget::item:selected {
+    background: rgba(43,108,126,0.12);
+    color: #0f172a;
+}
+
+QHeaderView::section {
+    background: rgba(15,23,42,0.04);
+    border: none;
+    padding: 10px;
+    font-weight: 900;
+    color: #0f172a;
+}
