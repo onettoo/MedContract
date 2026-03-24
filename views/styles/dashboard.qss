@@ -1,0 +1,457 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+   MedContract Dashboard Stylesheet - Light Mode
+   Modern Professional Healthcare Design
+   ═════════════════════════════════════════════════════════════════════════ */
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Global / Root
+   ───────────────────────────────────────────────────────────────────────── */
+
+QWidget#Dashboard {
+    background-color: #ffffff;
+    color: #0f172a;
+}
+
+QScrollArea#dashScroll {
+    background-color: #ffffff;
+    border: none;
+}
+
+QScrollArea#dashScroll > QWidget {
+    background-color: #ffffff;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Topbar
+   ───────────────────────────────────────────────────────────────────────── */
+
+QFrame#topbar {
+    background-color: #ffffff;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+QLabel#dashTitle {
+    font-size: 28px;
+    font-weight: 700;
+    color: #0f172a;
+}
+
+QLabel#dashSubtitle {
+    font-size: 14px;
+    font-weight: 400;
+    color: #64748b;
+}
+
+QLabel#updatedLabel {
+    font-size: 12px;
+    color: #64748b;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Period Selector Combo
+   ───────────────────────────────────────────────────────────────────────── */
+
+QComboBox#periodCombo {
+    background-color: #f8fafc;
+    color: #0f172a;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 14px;
+}
+
+QComboBox#periodCombo:hover {
+    border: 1px solid #2b6c7e;
+}
+
+QComboBox#periodCombo:focus {
+    border: 1px solid #2b6c7e;
+    outline: 3px solid rgba(43, 108, 126, 0.1);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Loading Bar
+   ───────────────────────────────────────────────────────────────────────── */
+
+QFrame#loadingBar {
+    background-color: transparent;
+}
+
+QProgressBar#loadingBarInner {
+    background-color: transparent;
+    border: none;
+    border-radius: 1px;
+}
+
+QProgressBar#loadingBarInner::chunk {
+    background-color: #2b6c7e;
+    border-radius: 1px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Error Banner
+   ───────────────────────────────────────────────────────────────────────── */
+
+QLabel#dashError {
+    background-color: rgba(220, 38, 38, 0.1);
+    color: #dc2626;
+    border: 1px solid rgba(220, 38, 38, 0.3);
+    border-radius: 6px;
+    padding: 12px 14px;
+    font-size: 14px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Header Strips
+   ───────────────────────────────────────────────────────────────────────── */
+
+QFrame#headerStrip {
+    background-color: transparent;
+    border-bottom: 1px solid #e2e8f0;
+    padding-bottom: 12px;
+    margin-bottom: 12px;
+}
+
+QLabel#headerStripText {
+    font-size: 20px;
+    font-weight: 600;
+    color: #0f172a;
+}
+
+QLabel#headerStripIcon {
+    font-size: 20px;
+}
+
+QLabel#headerStripRight {
+    font-size: 12px;
+    color: #64748b;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Metric Cards
+   ───────────────────────────────────────────────────────────────────────── */
+
+QFrame#metricCard {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 16px;
+}
+
+QFrame#metricCard:hover {
+    background-color: #f8fafc;
+    border: 1px solid #e2e8f0;
+}
+
+QLabel#metricIcon {
+    font-size: 24px;
+}
+
+QLabel#metricValue {
+    font-size: 24px;
+    font-weight: 500;
+    color: #2b6c7e;
+    font-family: 'SF Mono', 'Courier New', monospace;
+}
+
+QLabel#metricTitle {
+    font-size: 14px;
+    font-weight: 400;
+    color: #64748b;
+}
+
+QLabel#metricTrend {
+    font-size: 12px;
+    color: #059669;
+    font-weight: 500;
+}
+
+QFrame#metricCard[severity="danger"] QLabel#metricValue {
+    color: #dc2626;
+}
+
+QFrame#metricCard[severity="warning"] QLabel#metricValue {
+    color: #d97706;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Live Metric Cards
+   ───────────────────────────────────────────────────────────────────────── */
+
+QFrame#liveMetricCard {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 16px;
+}
+
+QFrame#liveMetricCard:hover {
+    background-color: #f8fafc;
+}
+
+QLabel#liveMetricIcon {
+    font-size: 20px;
+}
+
+QLabel#liveMetricTitle {
+    font-size: 14px;
+    font-weight: 500;
+    color: #0f172a;
+}
+
+QLabel#liveMetricValue {
+    font-size: 28px;
+    font-weight: 600;
+    color: #2b6c7e;
+    font-family: 'SF Mono', 'Courier New', monospace;
+}
+
+QLabel#liveMetricSub {
+    font-size: 12px;
+    color: #64748b;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Action Cards / Buttons
+   ───────────────────────────────────────────────────────────────────────── */
+
+QFrame#card {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+
+QFrame#card:hover {
+    background-color: #f8fafc;
+    border: 1px solid #2b6c7e;
+}
+
+QFrame#card:focus {
+    border: 2px solid #2b6c7e;
+    outline: 3px solid rgba(43, 108, 126, 0.1);
+}
+
+QPushButton {
+    background-color: #2b6c7e;
+    color: #ffffff;
+    border: none;
+    border-radius: 6px;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 500;
+}
+
+QPushButton:hover {
+    background-color: #3d8fa3;
+}
+
+QPushButton:pressed {
+    background-color: #1f4d5f;
+}
+
+QPushButton:focus {
+    outline: 3px solid rgba(43, 108, 126, 0.2);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Input Fields
+   ───────────────────────────────────────────────────────────────────────── */
+
+QLineEdit {
+    background-color: #f8fafc;
+    color: #0f172a;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 14px;
+}
+
+QLineEdit:focus {
+    border: 1px solid #2b6c7e;
+    outline: 3px solid rgba(43, 108, 126, 0.1);
+}
+
+QLineEdit::placeholder {
+    color: #cbd5e1;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Soft Line Divider
+   ───────────────────────────────────────────────────────────────────────── */
+
+QFrame#softLine {
+    background-color: #e2e8f0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Scrollbar Styling
+   ───────────────────────────────────────────────────────────────────────── */
+
+QScrollBar:vertical {
+    background-color: transparent;
+    width: 8px;
+}
+
+QScrollBar::handle:vertical {
+    background-color: #cbd5e1;
+    border-radius: 4px;
+    min-height: 20px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background-color: #94a3b8;
+}
+
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    border: none;
+    background: none;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Dark Mode Overrides
+   ═════════════════════════════════════════════════════════════════════════ */
+
+QWidget#Dashboard[theme="dark"] {
+    background-color: #0f172a;
+    color: #f1f5f9;
+}
+
+QScrollArea#dashScroll[theme="dark"] {
+    background-color: #0f172a;
+}
+
+QScrollArea#dashScroll[theme="dark"] > QWidget {
+    background-color: #0f172a;
+}
+
+QFrame#topbar[theme="dark"] {
+    background-color: #1e293b;
+    border-bottom: 1px solid #334155;
+}
+
+QLabel#dashTitle[theme="dark"] {
+    color: #f1f5f9;
+}
+
+QLabel#dashSubtitle[theme="dark"] {
+    color: #cbd5e1;
+}
+
+QLabel#updatedLabel[theme="dark"] {
+    color: #cbd5e1;
+}
+
+QComboBox#periodCombo[theme="dark"] {
+    background-color: #1e293b;
+    color: #f1f5f9;
+    border: 1px solid #334155;
+}
+
+QComboBox#periodCombo[theme="dark"]:hover {
+    border: 1px solid #3d8fa3;
+}
+
+QComboBox#periodCombo[theme="dark"]:focus {
+    border: 1px solid #3d8fa3;
+}
+
+QFrame#headerStrip[theme="dark"] {
+    border-bottom: 1px solid #334155;
+}
+
+QLabel#headerStripText[theme="dark"] {
+    color: #f1f5f9;
+}
+
+QLabel#headerStripRight[theme="dark"] {
+    color: #cbd5e1;
+}
+
+QFrame#metricCard[theme="dark"] {
+    background-color: #1e293b;
+    border: 1px solid #334155;
+}
+
+QFrame#metricCard[theme="dark"]:hover {
+    background-color: #334155;
+}
+
+QLabel#metricValue[theme="dark"] {
+    color: #3d8fa3;
+}
+
+QLabel#metricTitle[theme="dark"] {
+    color: #cbd5e1;
+}
+
+QFrame#liveMetricCard[theme="dark"] {
+    background-color: #1e293b;
+    border: 1px solid #334155;
+}
+
+QFrame#liveMetricCard[theme="dark"]:hover {
+    background-color: #334155;
+}
+
+QLabel#liveMetricTitle[theme="dark"] {
+    color: #f1f5f9;
+}
+
+QLabel#liveMetricValue[theme="dark"] {
+    color: #3d8fa3;
+}
+
+QLabel#liveMetricSub[theme="dark"] {
+    color: #cbd5e1;
+}
+
+QFrame#card[theme="dark"] {
+    background-color: #1e293b;
+    border: 1px solid #334155;
+}
+
+QFrame#card[theme="dark"]:hover {
+    background-color: #334155;
+    border: 1px solid #3d8fa3;
+}
+
+QPushButton[theme="dark"] {
+    background-color: #2b6c7e;
+}
+
+QPushButton[theme="dark"]:hover {
+    background-color: #3d8fa3;
+}
+
+QLineEdit[theme="dark"] {
+    background-color: #1e293b;
+    color: #f1f5f9;
+    border: 1px solid #334155;
+}
+
+QLineEdit[theme="dark"]:focus {
+    border: 1px solid #3d8fa3;
+}
+
+QLineEdit::placeholder[theme="dark"] {
+    color: #64748b;
+}
+
+QFrame#softLine[theme="dark"] {
+    background-color: #334155;
+}
+
+QScrollBar::handle:vertical[theme="dark"] {
+    background-color: #475569;
+}
+
+QScrollBar::handle:vertical[theme="dark"]:hover {
+    background-color: #64748b;
+}
+
+QLabel#dashError[theme="dark"] {
+    background-color: rgba(220, 38, 38, 0.15);
+    color: #ff7a7a;
+    border: 1px solid rgba(220, 38, 38, 0.4);
+}
