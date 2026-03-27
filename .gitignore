@@ -94,8 +94,7 @@ tmp/
 # ==========================================
 # Documentos Gerados
 # ==========================================
-Contratos/*.docx
-!Contratos/contrato_*.docx
+Contratos/
 *.pdf
 exports/
 relatorios/
@@ -136,6 +135,17 @@ releases/
 # ==========================================
 config.local.py
 settings.local.py
+
+# ==========================================
+# Ferramentas de IA (locais)
+# ==========================================
+.claude/
+.superpowers/
+
+# ==========================================
+# Pastas temporárias de teste
+# ==========================================
+tmp_backup_test/
 
 # ==========================================
 # Certificados SSL
