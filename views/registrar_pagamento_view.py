@@ -29,18 +29,18 @@ from PySide6.QtGui import QColor, QKeySequence, QShortcut
 # ══════════════════════════════════════════════════════════════════════════════
 class Theme:
     """Modern SaaS design tokens - consistent with dashboard."""
-    PRIMARY = "#6366f1"
-    PRIMARY_HOVER = "#4f46e5"
-    PRIMARY_SOFT = "rgba(99,102,241,0.10)"
-    PRIMARY_BORDER = "rgba(99,102,241,0.30)"
+    PRIMARY = "#1a6b7c"
+    PRIMARY_HOVER = "#155e6d"
+    PRIMARY_SOFT = "rgba(26,107,124,0.10)"
+    PRIMARY_BORDER = "rgba(26,107,124,0.30)"
     
     SUCCESS = "#10b981"
     SUCCESS_SOFT = "rgba(16,185,129,0.08)"
     SUCCESS_BORDER = "rgba(16,185,129,0.25)"
     
-    DANGER = "#ef4444"
-    DANGER_SOFT = "rgba(239,68,68,0.08)"
-    DANGER_BORDER = "rgba(239,68,68,0.25)"
+    DANGER = "#c0392b"
+    DANGER_SOFT = "rgba(192,57,43,0.08)"
+    DANGER_BORDER = "rgba(192,57,43,0.25)"
     
     WARNING = "#f59e0b"
     WARNING_SOFT = "rgba(245,158,11,0.08)"
@@ -198,6 +198,32 @@ def money_format_br(v: float) -> str:
         return f"{'.'.join(reversed(groups))},{frac_part}"
     except Exception:
         return "0,00"
+
+
+def money_from_db(value) -> float:
+    """Converte valor monetário vindo do banco sem aplicar cálculo de negócio."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float, Decimal)):
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+    s = str(value).strip()
+    if not s:
+        return 0.0
+    s = s.replace("R$", "").replace("r$", "").replace(" ", "")
+    if "," in s and "." in s:
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1023,7 +1049,7 @@ class RegistrarPagamentoView(QWidget):
             sh = QGraphicsDropShadowEffect(self.card)
             sh.setBlurRadius(32)
             sh.setOffset(0, 10)
-            sh.setColor(QColor(99, 102, 241, 30))
+            sh.setColor(QColor(26, 107, 124, 30))
             self.card.setGraphicsEffect(sh)
 
             # Preview card shadow
@@ -1457,7 +1483,7 @@ class RegistrarPagamentoView(QWidget):
             self._cliente["forma_pagamento"] = None
             self._cliente["dia_vencimento"] = 0
             self._cliente["documento"] = self.cpf.text().strip()
-            self._cliente["valor_mensal"] = float(valor_mensal or 0.0)
+            self._cliente["valor_mensal"] = money_from_db(valor_mensal)
             self._cliente["ultimo_pagamento"] = ultimo_pagamento
 
             # Update preview card
@@ -1550,7 +1576,7 @@ class RegistrarPagamentoView(QWidget):
             self._cliente["forma_pagamento"] = forma_pagamento
             self._cliente["dia_vencimento"] = int(dia_vencimento or 0)
             self._cliente["documento"] = self.cnpj.text().strip()
-            self._cliente["valor_mensal"] = float(valor_mensal or 0.0)
+            self._cliente["valor_mensal"] = money_from_db(valor_mensal)
             self._cliente["ultimo_pagamento"] = ultimo_pagamento
 
             self.p_nome.setText(str(nome or "—"))
@@ -2059,7 +2085,7 @@ class RegistrarPagamentoView(QWidget):
     # ══════════════════════════════════════════════════════════════════════════
     def apply_styles(self):
         """Apply modern SaaS stylesheet."""
-        self.setStyleSheet(build_view_qss("RegistrarPagamento", f"""
+        base_qss = build_view_qss("RegistrarPagamento", f"""
         /* ══════════════════════════════════════════════════════════════
            MODERN SAAS PAYMENT REGISTRATION - Indigo Design System
            Premium aesthetics with enhanced UX
@@ -2399,6 +2425,12 @@ class RegistrarPagamentoView(QWidget):
             color: {Theme.DANGER};
         }}
 
+        QLabel#statusBadge[status="em_atraso"] {{
+            background: {Theme.DANGER_SOFT};
+            border-color: {Theme.DANGER_BORDER};
+            color: {Theme.DANGER};
+        }}
+
         QLabel#pIcon {{
             font-size: 16px;
         }}
@@ -2605,4 +2637,7 @@ class RegistrarPagamentoView(QWidget):
         QScrollBar::sub-page:vertical {{
             background: transparent;
         }}
-        """))
+        """)
+        self._base_qss = base_qss
+        self.setStyleSheet(base_qss)
+

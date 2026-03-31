@@ -146,6 +146,13 @@ settings.local.py
 # Pastas temporárias de teste
 # ==========================================
 tmp_backup_test/
+tmp_contract_test/
+tmp_*/
+
+# ==========================================
+# Superpowers (ferramenta de IA)
+# ==========================================
+docs/superpowers/
 
 # ==========================================
 # Certificados SSL

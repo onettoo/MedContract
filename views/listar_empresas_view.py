@@ -118,6 +118,7 @@ def _status_label(value: str) -> str:
     return {
         "em_dia": "Em dia",
         "pendente": "Pendente",
+        "em_atraso": "Em atraso",
         "inadimplente": "Inadimplente",
     }.get(txt, _safe_text(value))
 
@@ -251,6 +252,8 @@ class ListarEmpresasView(QWidget):
             search = self._settings.value(self._settings_key("search"), "", type=str) or ""
             forma = (self._settings.value(self._settings_key("forma"), "", type=str) or "").strip().lower()
             status = (self._settings.value(self._settings_key("status"), "", type=str) or "").strip().lower()
+            if status == "inadimplente":
+                status = "em_atraso"
             try:
                 page_size = int(self._settings.value(self._settings_key("page_size"), 30))
             except Exception:
@@ -303,7 +306,7 @@ class ListarEmpresasView(QWidget):
         top.addLayout(title_wrap)
         top.addStretch()
 
-        self.btn_voltar = QPushButton("Voltar")
+        self.btn_voltar = QPushButton("← Voltar")
         self.btn_voltar.setObjectName("btnSecondary")
         self.btn_voltar.setFixedHeight(36)
         self.btn_voltar.setMinimumWidth(96)
@@ -313,7 +316,7 @@ class ListarEmpresasView(QWidget):
         top.addWidget(self.btn_voltar)
         root.addLayout(top)
 
-        self.btn_novo = QPushButton("+ Novo")
+        self.btn_novo = QPushButton("＋ Nova empresa")
         self.btn_novo.setObjectName("btnPrimary")
         self.btn_novo.setFixedHeight(36)
         self.btn_novo.setMinimumWidth(116)
@@ -321,7 +324,7 @@ class ListarEmpresasView(QWidget):
         self.btn_novo.setToolTip("Cadastrar nova empresa")
         self.btn_novo.clicked.connect(self._novo_empresa)
 
-        self.btn_importar = QPushButton("Importar")
+        self.btn_importar = QPushButton("⬆ Importar")
         self.btn_importar.setObjectName("btnSecondary")
         self.btn_importar.setFixedHeight(36)
         self.btn_importar.setMinimumWidth(110)
@@ -329,18 +332,18 @@ class ListarEmpresasView(QWidget):
         self.btn_importar.setToolTip("Importar empresas por planilha (.xlsx/.csv)")
         self.btn_importar.clicked.connect(self.importar_signal.emit)
 
-        self.btn_editar_sel = QPushButton("Editar")
+        self.btn_editar_sel = QPushButton("✎ Editar selecionada")
         self.btn_editar_sel.setObjectName("btnSecondary")
         self.btn_editar_sel.setFixedHeight(36)
-        self.btn_editar_sel.setMinimumWidth(98)
+        self.btn_editar_sel.setMinimumWidth(164)
         self.btn_editar_sel.setCursor(Qt.PointingHandCursor)
         self.btn_editar_sel.setToolTip("Editar empresa selecionada")
         self.btn_editar_sel.clicked.connect(self._editar_selecionado)
 
-        self.btn_excluir_sel = QPushButton("Excluir")
+        self.btn_excluir_sel = QPushButton("🗑 Excluir selecionada")
         self.btn_excluir_sel.setObjectName("btnDanger")
         self.btn_excluir_sel.setFixedHeight(36)
-        self.btn_excluir_sel.setMinimumWidth(98)
+        self.btn_excluir_sel.setMinimumWidth(170)
         self.btn_excluir_sel.setCursor(Qt.PointingHandCursor)
         self.btn_excluir_sel.setToolTip("Excluir empresa selecionada")
         self.btn_excluir_sel.clicked.connect(self._excluir_selecionado)
@@ -384,7 +387,7 @@ class ListarEmpresasView(QWidget):
         self.chip_em_dia.setObjectName("statChipOk")
         self.chip_pendente = QLabel("Pendente: -")
         self.chip_pendente.setObjectName("statChipWarn")
-        self.chip_inadimplente = QLabel("Inadimplente: -")
+        self.chip_inadimplente = QLabel("Em atraso: -")
         self.chip_inadimplente.setObjectName("statChipDanger")
         self.chip_visiveis = QLabel("Visiveis: -")
         self.chip_visiveis.setObjectName("statChipInfo")
@@ -443,7 +446,7 @@ class ListarEmpresasView(QWidget):
         self.filter_status.addItem("Status: todos", "")
         self.filter_status.addItem("Em dia", "em_dia")
         self.filter_status.addItem("Pendente", "pendente")
-        self.filter_status.addItem("Inadimplente", "inadimplente")
+        self.filter_status.addItem("Em atraso", "em_atraso")
         self.filter_status.currentIndexChanged.connect(self._on_filter_changed)
 
         self.page_size_combo = StyledComboBox()
@@ -452,13 +455,13 @@ class ListarEmpresasView(QWidget):
         self.page_size_combo.addItems(["30 / pagina", "50 / pagina", "100 / pagina"])
         self.page_size_combo.currentIndexChanged.connect(self._on_page_size_changed)
 
-        self.btn_reload = QPushButton("Atualizar")
+        self.btn_reload = QPushButton("↻ Atualizar")
         self.btn_reload.setObjectName("btnSecondary")
         self.btn_reload.setFixedHeight(42)
         self.btn_reload.setCursor(Qt.PointingHandCursor)
         self.btn_reload.clicked.connect(self.reload)
 
-        self.btn_clear_filters = QPushButton("Limpar filtros")
+        self.btn_clear_filters = QPushButton("✕ Limpar filtros")
         self.btn_clear_filters.setObjectName("btnSecondary")
         self.btn_clear_filters.setFixedHeight(42)
         self.btn_clear_filters.setCursor(Qt.PointingHandCursor)
@@ -564,11 +567,11 @@ class ListarEmpresasView(QWidget):
         self.lbl_visible.setObjectName("pagerText")
         self.lbl_page = QLabel("Pagina 1 de 1")
         self.lbl_page.setObjectName("pagerText")
-        self.btn_prev = QPushButton("Anterior")
+        self.btn_prev = QPushButton("← Anterior")
         self.btn_prev.setObjectName("btnSecondary")
         self.btn_prev.setFixedHeight(38)
         self.btn_prev.clicked.connect(self._go_prev)
-        self.btn_next = QPushButton("Proxima")
+        self.btn_next = QPushButton("Próxima →")
         self.btn_next.setObjectName("btnSecondary")
         self.btn_next.setFixedHeight(38)
         self.btn_next.clicked.connect(self._go_next)
@@ -668,14 +671,14 @@ class ListarEmpresasView(QWidget):
         quick = QGridLayout()
         quick.setHorizontalSpacing(10)
         quick.setVerticalSpacing(8)
-        self.btn_quick_edit = QPushButton("Editar")
+        self.btn_quick_edit = QPushButton("✎ Editar")
         self.btn_quick_edit.setObjectName("btnSecondary")
         self.btn_quick_edit.setFixedHeight(40)
         self.btn_quick_edit.setCursor(Qt.PointingHandCursor)
         self.btn_quick_edit.setToolTip("Editar empresa selecionada")
         self.btn_quick_edit.clicked.connect(self._editar_selecionado)
 
-        self.btn_quick_del = QPushButton("Excluir")
+        self.btn_quick_del = QPushButton("🗑 Excluir")
         self.btn_quick_del.setObjectName("btnDanger")
         self.btn_quick_del.setFixedHeight(40)
         self.btn_quick_del.setCursor(Qt.PointingHandCursor)
@@ -815,7 +818,10 @@ class ListarEmpresasView(QWidget):
         self.search.setText(search_text or "")
         idx_forma = self.filter_forma.findData((forma_pagamento or "").strip().lower())
         self.filter_forma.setCurrentIndex(max(0, idx_forma))
-        idx_status = self.filter_status.findData((status_pagamento or "").strip().lower())
+        status_key = (status_pagamento or "").strip().lower()
+        if status_key == "inadimplente":
+            status_key = "em_atraso"
+        idx_status = self.filter_status.findData(status_key)
         self.filter_status.setCurrentIndex(max(0, idx_status))
         self._page = 0
         self._persist_view_state()
@@ -956,7 +962,7 @@ class ListarEmpresasView(QWidget):
         lay.setContentsMargins(4, 3, 4, 3)
         lay.setSpacing(6)
 
-        btn_edit = QPushButton("Editar")
+        btn_edit = QPushButton("✎ Editar")
         btn_edit.setObjectName("btnTableEdit")
         btn_edit.setFixedHeight(28)
         btn_edit.setMinimumWidth(70)
@@ -967,7 +973,7 @@ class ListarEmpresasView(QWidget):
         lay.addWidget(btn_edit)
         total_width = btn_edit.minimumWidth() + 18
         if self._can_delete_empresa:
-            btn_del = QPushButton("Excluir")
+            btn_del = QPushButton("🗑 Excluir")
             btn_del.setObjectName("btnTableDelete")
             btn_del.setFixedHeight(28)
             btn_del.setMinimumWidth(70)
@@ -1029,7 +1035,7 @@ class ListarEmpresasView(QWidget):
         if counts:
             em_dia = int((counts or {}).get("em_dia", 0) or 0)
             pendente = int((counts or {}).get("pendente", 0) or 0)
-            inadimplente = int((counts or {}).get("inadimplente", 0) or 0)
+            inadimplente = int((counts or {}).get("em_atraso", (counts or {}).get("inadimplente", 0)) or 0)
         else:
             em_dia = 0
             pendente = 0
@@ -1040,13 +1046,13 @@ class ListarEmpresasView(QWidget):
                     em_dia += 1
                 elif st == "pendente":
                     pendente += 1
-                elif st == "inadimplente":
+                elif st in {"inadimplente", "em_atraso"}:
                     inadimplente += 1
 
         self.chip_total.setText(f"Total: {self._total}")
         self.chip_em_dia.setText(f"Em dia: {em_dia}")
         self.chip_pendente.setText(f"Pendente: {pendente}")
-        self.chip_inadimplente.setText(f"Inadimplente: {inadimplente}")
+        self.chip_inadimplente.setText(f"Em atraso: {inadimplente}")
         self.chip_visiveis.setText(f"Visiveis: {len(self._rows_visible)}")
 
     def reload(self):
@@ -1358,8 +1364,7 @@ class ListarEmpresasView(QWidget):
         self.inline_msg.style().polish(self.inline_msg)
 
     def apply_styles(self):
-        self.setStyleSheet(
-            f"""
+        base_qss = f"""
             QWidget#ListarEmpresas {{
                 background: {_BG};
             }}
@@ -1767,4 +1772,6 @@ class ListarEmpresasView(QWidget):
                 color: {_GOOD};
             }}
             """
-        )
+        self._base_qss = base_qss
+        self.setStyleSheet(base_qss)
+

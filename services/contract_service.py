@@ -3,13 +3,16 @@ from __future__ import annotations
 
 import calendar
 import io
+import logging
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import unicodedata
+from logging.handlers import RotatingFileHandler
 from copy import deepcopy
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -19,11 +22,21 @@ from uuid import uuid4
 
 from models.contract_models import ContractTemplateProfile
 
+logger = logging.getLogger(__name__)
+
+_CONTRACT_LOGGER_LOCK = threading.Lock()
+_CONTRACT_LOGGER_READY = False
+_CONTRACT_LOG_FILE: Path | None = None
+
 _PLACEHOLDER_RE = re.compile(
     r"x{3}\.x{3}\.x{3}-x{2}|xx\.xxx-xxx|xx/xx/xxxx|\(\d{2}\)\s*x{5}-x{4}|x{3}",
     re.IGNORECASE,
 )
-_NAMED_PLACEHOLDER_RE = re.compile(r"\{\{\s*([^{}]{1,80}?)\s*\}\}|\{\s*([^{}]{1,80}?)\s*\}")
+_NAMED_PLACEHOLDER_RE = re.compile(
+    r"\{\{\s*([^{}]{1,120}?)\s*\}\}|\{\s*([^{}]{1,120}?)\s*\}|\[\s*([^\[\]]{1,160}?)\s*\]"
+)
+_CURLY_PLACEHOLDER_RE = re.compile(r"\{\{\s*[^{}]{1,120}\s*\}\}|\{\s*[^{}]{1,120}\s*\}")
+_BRACKET_PLACEHOLDER_RE = re.compile(r"\[([^\[\]\n]{1,160})\]")
 
 _WORD_CONVERT_LOCK = threading.RLock()
 _TEMPLATE_CACHE_LOCK = threading.Lock()
@@ -85,6 +98,56 @@ def build_contract_template_profile(contract_type: str, operation: str = "padrao
     return ContractTemplateProfile(contract_type=tipo, operation=op, candidates=candidates)
 
 
+def _resolve_contract_logs_dir() -> Path:
+    root_logger = logging.getLogger()
+    for handler in list(getattr(root_logger, "handlers", []) or []):
+        base = getattr(handler, "baseFilename", None)
+        if not base:
+            continue
+        try:
+            path = Path(str(base)).resolve().parent
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except Exception:
+            continue
+    fallback = Path.cwd() / "logs"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def _ensure_contract_file_logger():
+    global _CONTRACT_LOGGER_READY, _CONTRACT_LOG_FILE
+    if _CONTRACT_LOGGER_READY:
+        return
+    with _CONTRACT_LOGGER_LOCK:
+        if _CONTRACT_LOGGER_READY:
+            return
+        logs_dir = _resolve_contract_logs_dir()
+        log_file = logs_dir / "contract_generation.log"
+        target = str(log_file.resolve())
+
+        for h in list(getattr(logger, "handlers", []) or []):
+            base = getattr(h, "baseFilename", None)
+            if base and str(Path(str(base)).resolve()) == target:
+                _CONTRACT_LOG_FILE = log_file
+                _CONTRACT_LOGGER_READY = True
+                return
+
+        handler = RotatingFileHandler(
+            log_file,
+            maxBytes=2 * 1024 * 1024,
+            backupCount=5,
+            encoding="utf-8",
+        )
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] [contract] %(message)s"))
+        logger.addHandler(handler)
+
+        _CONTRACT_LOG_FILE = log_file
+        _CONTRACT_LOGGER_READY = True
+        logger.info("Contrato: log dedicado ativo (%s).", str(log_file))
+
+
 def generate_contract_pdf(
     cliente: dict,
     dependentes: list[dict],
@@ -92,46 +155,62 @@ def generate_contract_pdf(
     operation: str = "padrao",
     output_dir: Path | None = None,
 ) -> Path:
+    _ensure_contract_file_logger()
+    started_at = time.perf_counter()
     tipo = normalize_contract_type(contract_type)
     if tipo not in {"pix", "boleto", "recepcao"}:
-        raise ValueError("Tipo de contrato invÃ¡lido. Use pix, boleto ou recepcao.")
+        raise ValueError("Tipo de contrato inválido. Use pix, boleto ou recepcao.")
+    _validate_contract_inputs(cliente, dependentes, tipo, operation)
 
     template = resolve_contract_template(tipo, operation)
     if not template.exists():
         raise FileNotFoundError(
-            f"Template nÃ£o encontrado para tipo={tipo} e operacao={normalize_contract_operation(operation)}: {template}"
+            f"Template não encontrado para tipo={tipo} e operacao={normalize_contract_operation(operation)}: {template}"
         )
-
-    Document, Paragraph = _import_docx()
-    doc = _load_template_doc(Document, template)
-
-    payload = _build_payload(cliente, dependentes)
-    _fill_main_fields(doc, payload)
-    _apply_dependentes_block(doc, payload["dependentes"], Paragraph)
-    _assert_no_placeholders(doc)
-
-    out_dir = Path(output_dir) if output_dir else _default_downloads_dir()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    hoje_iso = datetime.now().strftime("%Y-%m-%d")
-    nome_slug = _slugify_filename(payload["nome"] or "cliente")
-    target_pdf = _unique_path(out_dir / f"contrato_{tipo}_{nome_slug}_{hoje_iso}.pdf")
-
-    tmp_docx = Path(tempfile.gettempdir()) / f"medcontract_contract_{uuid4().hex}.docx"
-    tmp_pdf = tmp_docx.with_suffix(".pdf")
+    logger.info("Contrato: template selecionado (%s).", str(template))
 
     try:
-        doc.save(str(tmp_docx))
-        _convert_docx_to_pdf(tmp_docx, target_pdf)
-    finally:
-        for p in (tmp_docx, tmp_pdf):
-            try:
-                if p.exists():
-                    p.unlink()
-            except Exception:
-                pass
+        Document, Paragraph = _import_docx()
+        doc = _load_template_doc(Document, template)
 
-    return target_pdf
+        deps_normalizados = _normalize_dependentes_for_contract(dependentes)
+        payload = _build_payload(cliente, deps_normalizados)
+        _fill_main_fields(doc, payload)
+        applied_dep_block = _apply_dependentes_block(doc, payload["dependentes"], Paragraph)
+        if payload["dependentes"] and not applied_dep_block:
+            logger.warning(
+                "Contrato: bloco de dependentes não encontrado no template (%s). Dependentes podem não aparecer.",
+                str(template),
+            )
+        _assert_no_placeholders(doc)
+
+        out_dir = Path(output_dir) if output_dir else _default_downloads_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        hoje_iso = datetime.now().strftime("%Y-%m-%d")
+        nome_slug = _slugify_filename(payload["nome"] or "cliente")
+        target_pdf = _unique_path(out_dir / f"contrato_{tipo}_{nome_slug}_{hoje_iso}.pdf")
+
+        tmp_docx = Path(tempfile.gettempdir()) / f"medcontract_contract_{uuid4().hex}.docx"
+        tmp_pdf = tmp_docx.with_suffix(".pdf")
+        try:
+            doc.save(str(tmp_docx))
+            _convert_docx_to_pdf(tmp_docx, target_pdf)
+        finally:
+            for p in (tmp_docx, tmp_pdf):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
+
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.info("Contrato: PDF gerado (%s) em %sms.", str(target_pdf), elapsed_ms)
+        return target_pdf
+    except Exception:
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.exception("Contrato: falha na geração (tipo=%s, operacao=%s, tempo=%sms).", tipo, normalize_contract_operation(operation), elapsed_ms)
+        raise
 
 
 def _import_docx():
@@ -140,7 +219,7 @@ def _import_docx():
         from docx.text.paragraph import Paragraph  # type: ignore
     except Exception as exc:
         raise RuntimeError(
-            "Biblioteca python-docx nÃ£o instalada. Instale com: pip install python-docx"
+            "Biblioteca python-docx não instalada. Instale com: pip install python-docx"
         ) from exc
     return Document, Paragraph
 
@@ -224,6 +303,89 @@ def _digits(value: str) -> str:
     return "".join(ch for ch in (value or "") if ch.isdigit())
 
 
+def _mask_cpf_for_log(value: str) -> str:
+    d = _digits(value)
+    if len(d) >= 11:
+        return f"{d[:3]}.***.***-{d[-2:]}"
+    if d:
+        return f"{d[:2]}***"
+    return "-"
+
+
+def _mask_email_for_log(value: str) -> str:
+    txt = str(value or "").strip()
+    if "@" not in txt:
+        return "-"
+    user, _, domain = txt.partition("@")
+    if not user:
+        return f"***@{domain}"
+    return f"{user[0]}***@{domain}"
+
+
+def _sanitize_text_for_doc(value: str) -> str:
+    txt = _fix_common_mojibake(str(value or ""))
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+
+def _normalize_dependentes_for_contract(dependentes: list[dict] | None) -> list[dict]:
+    out: list[dict] = []
+    seen_cpfs: set[str] = set()
+    dropped_empty = 0
+    dropped_dup = 0
+    for dep in dependentes or []:
+        item = dict(dep or {})
+        nome = _sanitize_text_for_doc(item.get("nome") or "")
+        cpf_digits = _digits(item.get("cpf") or "")
+        cpf_fmt = _format_cpf(cpf_digits)
+        data_nascimento = _iso_to_br_date(item.get("data_nascimento") or "")
+        if not nome and (not cpf_digits) and data_nascimento in {"", "-"}:
+            dropped_empty += 1
+            continue
+        if len(cpf_digits) == 11 and cpf_digits in seen_cpfs:
+            dropped_dup += 1
+            continue
+        if len(cpf_digits) == 11:
+            seen_cpfs.add(cpf_digits)
+        out.append(
+            {
+                "nome": nome or "-",
+                "cpf": cpf_fmt,
+                "data_nascimento": data_nascimento or "-",
+            }
+        )
+    if dropped_empty or dropped_dup:
+        logger.warning(
+            "Contrato: dependentes normalizados (removidos_vazios=%s, removidos_duplicados=%s, finais=%s).",
+            dropped_empty,
+            dropped_dup,
+            len(out),
+        )
+    return out
+
+
+def _validate_contract_inputs(cliente: dict, dependentes: list[dict], tipo: str, operation: str):
+    if not isinstance(cliente, dict):
+        raise ValueError("Dados do cliente inválidos para geração de contrato.")
+    nome = _sanitize_text_for_doc(cliente.get("nome") or "")
+    if not nome:
+        raise ValueError("Nome do cliente é obrigatório para gerar o contrato.")
+    cpf_digits = _digits(cliente.get("cpf") or "")
+    if len(cpf_digits) != 11:
+        raise ValueError("CPF do cliente inválido para geração do contrato.")
+    if not isinstance(dependentes, list):
+        raise ValueError("Lista de dependentes inválida para geração do contrato.")
+    logger.info(
+        "Contrato: entrada validada (tipo=%s, operacao=%s, cliente=%s, cpf=%s, email=%s, dependentes=%s).",
+        tipo,
+        normalize_contract_operation(operation),
+        nome[:80],
+        _mask_cpf_for_log(cpf_digits),
+        _mask_email_for_log(cliente.get("email") or ""),
+        len(dependentes),
+    )
+
+
 def _format_cpf(value: str) -> str:
     d = _digits(value)
     if len(d) == 11:
@@ -262,27 +424,57 @@ def _iso_to_br_date(value: str) -> str:
     return s
 
 
+def _fix_common_mojibake(value: str) -> str:
+    txt = str(value or "")
+    if not txt:
+        return ""
+    fixes = {
+        "â€¢": "•",
+        "â€“": "-",
+        "â€”": "-",
+        "NÂº": "Nº",
+        "Âº": "º",
+    }
+    for bad, good in fixes.items():
+        txt = txt.replace(bad, good)
+    return txt.strip()
+
+
 def _build_address(endereco_raw: str, cep_raw: str) -> str:
-    parts = [p.strip() for p in str(endereco_raw or "").split("â€¢") if p.strip()]
+    endereco_raw = _sanitize_text_for_doc(endereco_raw)
+    # Alguns ambientes convertem bullets para "?".
+    endereco_raw = re.sub(r"\s+\?{1,3}\s+", " • ", endereco_raw)
+    endereco_raw = endereco_raw.replace("|", " • ")
+
     numero = "S/N"
+    numero_match = re.search(
+        r"\bN(?:Â)?(?:[º°o]|[úu]mero|\?+)?\.?\s*[:.]?\s*([A-Za-z0-9\-\/]+)\b",
+        endereco_raw,
+        flags=re.IGNORECASE,
+    )
+    if numero_match:
+        numero = numero_match.group(1).strip() or "S/N"
+        endereco_raw = (endereco_raw[:numero_match.start()] + " " + endereco_raw[numero_match.end():]).strip()
+
+    parts = [p.strip(" ,.-") for p in re.split(r"\s*(?:•|·|∙|â€¢|,)\s*", endereco_raw) if p.strip(" ,.-")]
+    if len(parts) < 2:
+        parts = [p.strip(" ,.-") for p in re.split(r"\s+-\s+", endereco_raw) if p.strip(" ,.-")]
+
     sem_numero: list[str] = []
     for p in parts:
-        m = re.search(r"N[ÂºÂ°]?\s*(.+)$", p, flags=re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            if val:
-                numero = val
+        p_norm = p.upper().strip()
+        if p_norm in {"RJ", "RJ.", "R.J."}:
             continue
-        if p.upper() in {"RJ", "RJ."}:
+        if re.match(r"^N(?:Â)?(?:[º°o]|[úu]mero|\?+)?\.?\s*$", p, flags=re.IGNORECASE):
             continue
         sem_numero.append(p)
 
-    logradouro = sem_numero[0] if len(sem_numero) > 0 else (parts[0] if parts else "-")
+    logradouro = sem_numero[0] if len(sem_numero) > 0 else "-"
     bairro = sem_numero[1] if len(sem_numero) > 1 else "-"
     cidade = sem_numero[2] if len(sem_numero) > 2 else "RIO DE JANEIRO"
     cep = _format_cep(cep_raw)
 
-    return f"{logradouro}, NÂº {numero}, {bairro} â€“ {cidade} â€“ CEP.: {cep}, RIO DE JANEIRO."
+    return f"{logradouro}, Nº {numero}, {bairro} - {cidade} - CEP.: {cep}, RIO DE JANEIRO."
 
 
 def _money_number_br(value: float) -> str:
@@ -402,11 +594,11 @@ def _first_payment_date(today: date, vencimento_dia: int) -> date:
 
 def _build_payload(cliente: dict, dependentes: list[dict]) -> dict:
     hoje = datetime.now().date()
-    nome = (cliente.get("nome") or "").strip()
+    nome = _sanitize_text_for_doc(cliente.get("nome") or "")
     cpf = _format_cpf(cliente.get("cpf", ""))
     data_nascimento = _iso_to_br_date(cliente.get("data_nascimento", ""))
     telefone = _format_phone(cliente.get("telefone", ""))
-    email = (cliente.get("email") or "").strip() or "-"
+    email = _sanitize_text_for_doc(cliente.get("email") or "") or "-"
     endereco = _build_address(cliente.get("endereco", ""), cliente.get("cep", ""))
 
     valor = _safe_float(cliente.get("valor_mensal"), 0.0)
@@ -421,7 +613,7 @@ def _build_payload(cliente: dict, dependentes: list[dict]) -> dict:
     deps_out: list[dict] = []
     for d in dependentes or []:
         deps_out.append({
-            "nome": (d.get("nome") or "").strip() or "-",
+            "nome": _sanitize_text_for_doc(d.get("nome") or "") or "-",
             "cpf": _format_cpf(d.get("cpf", "")),
             "data_nascimento": _iso_to_br_date(d.get("data_nascimento", "")),
         })
@@ -440,8 +632,12 @@ def _build_payload(cliente: dict, dependentes: list[dict]) -> dict:
         "dia_vencimento": str(venc_dia),
         "venc_dia": str(venc_dia),
         "venc_extenso": venc_extenso,
+        "dia_por_extenso": venc_extenso,
         "primeiro_pagamento": primeiro_pag,
         "forma_pagamento": forma_pagamento,
+        "data_assinatura": hoje.strftime("%d/%m/%Y"),
+        # Placeholder contratual de limite adicional ao IPCA.
+        "reajuste_maximo_pct": str(cliente.get("reajuste_maximo_pct") or "10"),
         "dependentes": deps_out,
     }
 
@@ -554,7 +750,7 @@ def _set_paragraph_text(paragraph, value: str):
         r.text = ""
 
 
-def _placeholder_values(payload: dict) -> dict[str, str]:
+def _placeholder_values(payload: dict, *, include_dependentes: bool = True) -> dict[str, str]:
     values: dict[str, str] = {}
 
     def _put(keys: Iterable[str], value: str):
@@ -566,50 +762,69 @@ def _placeholder_values(payload: dict) -> dict[str, str]:
             values[norm] = txt
             values[norm.replace("_", "")] = txt
 
-    _put(("nome",), payload.get("nome", ""))
+    _put(("nome", "nome_completo_do_a_aderente", "nome_completo_do_aderente", "nome_titular"), payload.get("nome", ""))
     _put(("cpf",), payload.get("cpf", ""))
     _put(("data_nascimento", "datanascimento"), payload.get("data_nascimento", ""))
-    _put(("endereco",), payload.get("endereco", ""))
+    _put(("endereco", "endereco_completo"), payload.get("endereco", ""))
     _put(("telefone", "celular"), payload.get("telefone", ""))
     _put(("email", "e-mail"), payload.get("email", ""))
-    _put(("data_adesao", "dataadesao"), payload.get("data_adesao", ""))
+    _put(("data_adesao", "dataadesao", "data_da_adesao"), payload.get("data_adesao", ""))
     _put(("valor_mensal", "valormensal"), payload.get("valor_mensal", ""))
+    _put(("valor",), payload.get("valor_num", ""))
     _put(("valor_num", "valornum"), payload.get("valor_num", ""))
-    _put(("valor_extenso", "valorextenso"), payload.get("valor_extenso", ""))
-    _put(("dia_vencimento", "vencimento_dia"), payload.get("dia_vencimento", payload.get("venc_dia", "")))
+    _put(("valor_extenso", "valorextenso", "valor_por_extenso"), payload.get("valor_extenso", ""))
+    _put(("dia_vencimento", "vencimento_dia", "dia"), payload.get("dia_vencimento", payload.get("venc_dia", "")))
     _put(("venc_dia", "vencimento"), payload.get("venc_dia", ""))
-    _put(("venc_extenso",), payload.get("venc_extenso", ""))
-    _put(("primeiro_pagamento",), payload.get("primeiro_pagamento", ""))
-    _put(("forma_pagamento",), payload.get("forma_pagamento", ""))
+    _put(("venc_extenso", "dia_por_extenso"), payload.get("venc_extenso", ""))
+    _put(("primeiro_pagamento", "data_do_primeiro_pagamento"), payload.get("primeiro_pagamento", ""))
+    _put(
+        (
+            "forma_pagamento",
+            "boleto_cartao_pix",
+            "boleto_cartao_pix_chave_pix_cnpj_42_591_560_0001_08",
+        ),
+        payload.get("forma_pagamento", ""),
+    )
+    _put(("data_assinatura", "data_de_assinatura"), payload.get("data_assinatura", payload.get("data_adesao", "")))
+    reajuste_pct = str(payload.get("reajuste_maximo_pct", "10") or "10").strip()
+    if reajuste_pct and "%" not in reajuste_pct:
+        reajuste_pct = f"{reajuste_pct}%"
+    _put(("x", "x_pct"), reajuste_pct)
 
-    deps = list(payload.get("dependentes", []) or [])
-    for idx in range(1, 11):
-        dep = dict(deps[idx - 1] or {}) if idx <= len(deps) else {}
-        nome = str(dep.get("nome") or "").strip() or "-"
-        cpf = str(dep.get("cpf") or "").strip() or "-"
-        data_nasc = str(dep.get("data_nascimento") or "").strip() or "-"
-        parentesco = str(dep.get("parentesco") or dep.get("grau_parentesco") or "").strip() or "Dependente"
-        _put((f"dep{idx}_nome", f"dependente{idx}_nome"), nome)
-        _put((f"dep{idx}_cpf", f"dependente{idx}_cpf"), cpf)
-        _put((f"dep{idx}_data_nascimento", f"dependente{idx}_data_nascimento"), data_nasc)
-        _put((f"dep{idx}_parentesco", f"dependente{idx}_parentesco"), parentesco)
+    if include_dependentes:
+        deps = list(payload.get("dependentes", []) or [])
+        for idx in range(1, 11):
+            dep = dict(deps[idx - 1] or {}) if idx <= len(deps) else {}
+            nome = str(dep.get("nome") or "").strip() or "-"
+            cpf = str(dep.get("cpf") or "").strip() or "-"
+            data_nasc = str(dep.get("data_nascimento") or "").strip() or "-"
+            parentesco = str(dep.get("parentesco") or dep.get("grau_parentesco") or "").strip() or "Dependente"
+            _put((f"dep{idx}_nome", f"dependente{idx}_nome", f"nome_do_dependente_{idx}"), nome)
+            _put((f"dep{idx}_cpf", f"dependente{idx}_cpf", f"cpf_do_dependente_{idx}"), cpf)
+            _put((f"dep{idx}_data_nascimento", f"dependente{idx}_data_nascimento"), data_nasc)
+            _put((f"data_nascimento_dependente_{idx}", f"data_nasc_dependente_{idx}"), data_nasc)
+            _put((f"dep{idx}_parentesco", f"dependente{idx}_parentesco"), parentesco)
 
     return values
 
 
 def _replace_named_placeholders(paragraph, values: dict[str, str]):
     txt = _paragraph_text(paragraph)
-    if "{" not in txt or "}" not in txt:
+    has_curly = ("{" in txt and "}" in txt)
+    has_bracket = ("[" in txt and "]" in txt)
+    if not has_curly and not has_bracket:
         return
 
     def _sub(match: re.Match) -> str:
-        key_raw = (match.group(1) or match.group(2) or "").strip()
+        key_raw = (match.group(1) or match.group(2) or match.group(3) or "").strip()
         norm = _normalize_placeholder_key(key_raw)
         if not norm:
             return match.group(0)
         repl = values.get(norm)
         if repl is None:
             repl = values.get(norm.replace("_", ""))
+        if repl is None and norm.startswith("boleto_") and "pix" in norm and "cnpj" in norm:
+            repl = values.get("forma_pagamento")
         return repl if repl is not None else match.group(0)
 
     replaced = _NAMED_PLACEHOLDER_RE.sub(_sub, txt)
@@ -617,58 +832,92 @@ def _replace_named_placeholders(paragraph, values: dict[str, str]):
         _set_paragraph_text(paragraph, replaced)
 
 
+def _replace_literal(paragraph, pattern: str, replacement: str, flags=re.IGNORECASE) -> bool:
+    txt = _paragraph_text(paragraph)
+    updated = re.sub(pattern, replacement, txt, flags=flags)
+    if updated == txt:
+        return False
+    _set_paragraph_text(paragraph, updated)
+    return True
+
+
 def _fill_main_fields(doc, payload: dict):
-    named_values = _placeholder_values(payload)
+    named_values = _placeholder_values(payload, include_dependentes=False)
+    forma_pagamento = str(payload.get("forma_pagamento") or "").strip().upper()
+    is_pix = "PIX" in forma_pagamento
     for p in _iter_all_paragraphs(doc):
         _replace_named_placeholders(p, named_values)
         txt = _paragraph_text(p)
         up = _plain_upper(txt)
 
         if "NOME COMPLETO:" in up:
-            _replace_after_label(p, "NOME COMPLETO:", r"x{3}", payload["nome"])
+            _replace_after_label(p, "NOME COMPLETO:", r"(x{3}|\[[^\]]+\])", payload["nome"])
         if "CPF:" in up and "DEPENDENTE" not in up:
-            _replace_after_label(p, "CPF:", r"x{3}\.x{3}\.x{3}-x{2}", payload["cpf"])
+            _replace_after_label(p, "CPF:", r"(x{3}\.x{3}\.x{3}-x{2}|\[[^\]]+\])", payload["cpf"])
         if "DATA DE NASCIMENTO:" in up and "NOME:" not in up:
-            _replace_after_label(p, "DATA DE NASCIMENTO:", r"(xx/xx/xxxx|x{3})", payload["data_nascimento"])
+            _replace_after_label(p, "DATA DE NASCIMENTO:", r"(xx/xx/xxxx|x{3}|\[[^\]]+\])", payload["data_nascimento"])
         if "ENDERECO RESIDENCIAL:" in up:
             _replace_tail_after_colon(p, payload["endereco"])
         if "TELEFONE:" in up:
-            _replace_after_label(p, "TELEFONE:", r"\(\d{2}\)\s*x{5}-x{4}", payload["telefone"])
+            _replace_after_label(p, "TELEFONE:", r"(\(\d{2}\)\s*x{5}-x{4}|\[[^\]]+\])", payload["telefone"])
         if "E-MAIL:" in up:
-            _replace_after_label(p, "E-MAIL:", r"x{3}", payload["email"])
+            _replace_after_label(p, "E-MAIL:", r"(x{3}|\[[^\]]+\])", payload["email"])
         if "DATA DA ADESAO:" in up:
-            _replace_after_label(p, "DATA DA ADESÃƒO:", r"x{3}", payload["data_adesao"])
+            _replace_after_label(p, "DATA DA ADESAO:", r"(x{3}|\[[^\]]+\])", payload["data_adesao"])
         if "VALOR MENSAL AJUSTADO NESSE CONTRATO:" in up:
-            _replace_first_regex(
+            if not _replace_first_regex(
                 p,
                 r"R\$\s*xxx\s*\(xxx\)",
                 f"R$ {payload['valor_num']}({payload['valor_extenso']})",
-            )
+            ):
+                _replace_first_regex(
+                    p,
+                    r"R\$\s*\[[^\]]+\]\s*\(\s*\[[^\]]+\]\s*\)",
+                    f"R$ {payload['valor_num']} ({payload['valor_extenso']})",
+                )
         if "VENCIMENTO TODO DIA" in up:
-            _replace_after_label(
+            if not _replace_after_label(
                 p,
                 "VENCIMENTO TODO DIA",
                 r"xxx\s*\(xxx\)",
                 f"{payload['venc_dia']} ({payload['venc_extenso']})",
-            )
+            ):
+                _replace_after_label(
+                    p,
+                    "VENCIMENTO TODO DIA",
+                    r"(\[[^\]]+\]\s*\(\s*\[[^\]]+\]\s*\)|\[[^\]]+\])",
+                    f"{payload['venc_dia']} ({payload['venc_extenso']})",
+                )
         if "PRIMEIRO PAGAMENTO EM" in up:
             _replace_after_label(
                 p,
                 "PRIMEIRO PAGAMENTO EM",
-                r"x{3}",
+                r"(x{3}|\[[^\]]+\])",
                 payload["primeiro_pagamento"],
+            )
+            _replace_after_label(
+                p,
+                "PAGAMENTO",
+                r"\[[^\]]+\]",
+                payload["forma_pagamento"],
+            )
+        if is_pix:
+            _replace_literal(
+                p,
+                r"\bPAGAMENTO\s+PIX\b",
+                "PAGAMENTO VIA PIX (CHAVE CNPJ 42.591.560/0001-08)",
             )
 
 
-def _apply_dependentes_block(doc, dependentes: list[dict], Paragraph):
+def _apply_dependentes_block(doc, dependentes: list[dict], Paragraph) -> bool:
     paragraphs = doc.paragraphs
     if not paragraphs:
-        return
+        return False
 
     start_idx = None
     end_idx = None
     header_txt = _plain_upper("O (A) ADERENTE, NESTE ATO INSCREVE OS SEGUINTES DEPENDENTES")
-    stop_txt = _plain_upper("CONDIÃ‡Ã•ES DOS SERVIÃ‡OS OFERECIDOS AO(S) ADERENTE(S)")
+    stop_txt = _plain_upper("CONDICOES DOS SERVICOS OFERECIDOS AO(S) ADERENTE(S)")
 
     for i, p in enumerate(paragraphs):
         t = _plain_upper(_paragraph_text(p))
@@ -680,15 +929,15 @@ def _apply_dependentes_block(doc, dependentes: list[dict], Paragraph):
             break
 
     if start_idx is None:
-        return
+        return False
     if end_idx is None:
         end_idx = min(len(paragraphs), start_idx + 4)
     if end_idx <= start_idx:
-        return
+        return False
 
     block = doc.paragraphs[start_idx:end_idx]
     if not block:
-        return
+        return False
 
     header_tpl = deepcopy(block[0]._p)
     dep_title_tpl = deepcopy(block[1]._p if len(block) > 1 else block[0]._p)
@@ -704,7 +953,7 @@ def _apply_dependentes_block(doc, dependentes: list[dict], Paragraph):
             pass
 
     if not dependentes:
-        return
+        return True
 
     def _insert_before_anchor(p_xml):
         if anchor is None:
@@ -718,20 +967,71 @@ def _apply_dependentes_block(doc, dependentes: list[dict], Paragraph):
     for i, dep in enumerate(dependentes, start=1):
         p_title = _insert_before_anchor(deepcopy(dep_title_tpl))
         _replace_first_regex(p_title, r"DEPENDENTE\s+\d+", f"DEPENDENTE {i}")
+        _replace_first_regex(p_title, r"\[\s*NOME\s+DO\s+DEPENDENTE\s+\d+\s*\]", dep["nome"])
 
         p_nome = _insert_before_anchor(deepcopy(dep_nome_tpl))
-        _replace_after_label(p_nome, "NOME:", r"x{3}", dep["nome"])
+        if not _replace_after_label(p_nome, "NOME:", r"(x{3}|\[[^\]]+\])", dep["nome"]):
+            _replace_first_regex(p_nome, r"\[\s*NOME\s+DO\s+DEPENDENTE\s+\d+\s*\]", dep["nome"])
 
         p_cpf = _insert_before_anchor(deepcopy(dep_cpf_tpl))
-        _replace_after_label(p_cpf, "CPF:", r"(x{3}\.x{3}\.x{3}-x{2}|x{3})", dep["cpf"])
-        _replace_after_label(p_cpf, "DATA DE NASCIMENTO:", r"(\d{2}/\d{2}/\d{4}|xx/xx/xxxx|x{3})", dep["data_nascimento"])
+        if not _replace_after_label(p_cpf, "CPF:", r"(x{3}\.x{3}\.x{3}-x{2}|x{3}|\[[^\]]+\])", dep["cpf"]):
+            _replace_first_regex(p_cpf, r"\[\s*CPF\s+DO\s+DEPENDENTE\s+\d+\s*\]", dep["cpf"])
+        if not _replace_after_label(
+            p_cpf,
+            "DATA DE NASCIMENTO:",
+            r"(\d{2}/\d{2}/\d{4}|xx/xx/xxxx|x{3}|\[[^\]]+\])",
+            dep["data_nascimento"],
+        ):
+            _replace_first_regex(
+                p_cpf,
+                r"\[\s*DATA\s+(?:NASCIMENTO|NASC)\s+DEPENDENTE\s+\d+\s*\]",
+                dep["data_nascimento"],
+            )
+    return True
 
 
 def _assert_no_placeholders(doc):
+    hint_keys = {
+        "nome",
+        "cpf",
+        "data",
+        "endereco",
+        "telefone",
+        "email",
+        "valor",
+        "dia",
+        "pagamento",
+        "dependente",
+        "assinatura",
+        "boleto",
+        "pix",
+        "cartao",
+        "x",
+    }
     for p in _iter_all_paragraphs(doc):
         txt = _paragraph_text(p)
         if _PLACEHOLDER_RE.search(txt):
-            raise RuntimeError("Ainda existem placeholders 'xxx' no contrato. Revise o template e os dados.")
+            preview = (txt or "").strip()[:220]
+            raise RuntimeError(
+                "Ainda existem placeholders 'xxx' no contrato. Revise o template e os dados. "
+                f"Trecho: {preview}"
+            )
+        if _CURLY_PLACEHOLDER_RE.search(txt):
+            preview = (txt or "").strip()[:220]
+            raise RuntimeError(
+                "Ainda existem placeholders com chaves no contrato. Revise o template e os dados. "
+                f"Trecho: {preview}"
+            )
+        for m in _BRACKET_PLACEHOLDER_RE.finditer(txt):
+            norm = _normalize_placeholder_key(m.group(1) or "")
+            if not norm:
+                continue
+            if any(k in norm for k in hint_keys):
+                preview = (txt or "").strip()[:220]
+                raise RuntimeError(
+                    "Ainda existem placeholders com colchetes no contrato. Revise o template e os dados. "
+                    f"Trecho: {preview}"
+                )
 
 
 def _convert_via_word_com(src_docx: Path, dst_pdf: Path) -> tuple[bool, str | None]:
@@ -792,21 +1092,26 @@ def _convert_docx_to_pdf(src_docx: Path, dst_pdf: Path):
     # Word COM, docx2pdf e LibreOffice em chamadas paralelas.
     with _WORD_CONVERT_LOCK:
         errors: list[str] = []
+        logger.debug("Contrato: iniciando conversão DOCX->PDF (%s -> %s).", str(src_docx), str(dst_pdf))
 
         ok, err = _convert_via_word_com(src_docx, dst_pdf)
         if ok:
+            logger.debug("Contrato: conversão concluída via Word COM.")
             return
         if err:
             errors.append(err)
+            logger.warning("Contrato: Word COM falhou (%s).", err)
 
         try:
             from docx2pdf import convert as docx2pdf_convert  # type: ignore
             docx2pdf_convert(str(src_docx), str(dst_pdf))
             if dst_pdf.exists():
+                logger.debug("Contrato: conversão concluída via docx2pdf.")
                 return
             errors.append("docx2pdf executou, mas nao gerou o PDF.")
         except Exception as exc:
             errors.append(f"docx2pdf: {exc}")
+            logger.warning("Contrato: docx2pdf falhou (%s).", exc)
 
         soffice = shutil.which("soffice") or shutil.which("libreoffice")
         if not soffice:
@@ -838,10 +1143,13 @@ def _convert_docx_to_pdf(src_docx: Path, dst_pdf: Path):
                         generated.replace(dst_pdf)
                 except Exception:
                     generated.replace(dst_pdf)
+                logger.debug("Contrato: conversão concluída via LibreOffice.")
                 return
             stderr = (proc.stderr or proc.stdout or "").strip()
             errors.append(f"LibreOffice: {stderr or 'falhou na conversao.'}")
+            logger.warning("Contrato: LibreOffice falhou (%s).", stderr or "falhou na conversao.")
         else:
             errors.append("LibreOffice nao encontrado no sistema.")
+            logger.warning("Contrato: LibreOffice não encontrado no sistema.")
 
         raise RuntimeError("Falha ao converter contrato para PDF. " + " | ".join(errors))

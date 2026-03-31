@@ -38,17 +38,9 @@ _DANGER_BORDER = PALETTE.danger_border
 
 
 def _load_fonts() -> str:
-    """Carrega DM Sans de assets/fonts/ e retorna o nome da família."""
-    fonts_dir = Path(__file__).resolve().parent / "assets" / "fonts"
-    family = "Segoe UI"
-    if fonts_dir.exists():
-        for ttf in fonts_dir.glob("*.ttf"):
-            fid = QFontDatabase.addApplicationFont(str(ttf))
-            if fid >= 0:
-                fams = QFontDatabase.applicationFontFamilies(fid)
-                if fams and "DM Sans" in fams[0]:
-                    family = fams[0]
-    return family
+    """Delega ao cache centralizado em ui_tokens para evitar I/O duplicado."""
+    from views.ui_tokens import get_sans_family
+    return get_sans_family()
 
 
 # ══════════════════════════════════════════════
@@ -1271,6 +1263,8 @@ class ListarClientesView(QWidget):
     editar_signal  = Signal(int)
     excluir_signal = Signal(int)
     cancelar_plano_signal = Signal(int)
+    renovar_contrato_signal = Signal(int)
+    renovar_contratos_signal = Signal(list)
     reajuste_planos_signal = Signal(dict)
     enviar_email_signal = Signal(dict)
     baixar_contrato_signal = Signal(int)
@@ -1404,12 +1398,15 @@ class ListarClientesView(QWidget):
         self._can_create_cliente = not self._is_recepcao
 
         self.btn_editar_sel.setVisible(self._can_edit_cliente)
+        self.btn_renovar_sel.setVisible(self._can_edit_cliente)
         self.btn_cancelar_sel.setVisible(self._can_edit_cliente)
         self.btn_reajuste_sel.setVisible(self._can_edit_cliente)
         self.btn_mark_visible.setVisible(self._can_edit_cliente)
         self.btn_clear_marked.setVisible(self._can_edit_cliente)
+        self.btn_renovar_marked.setVisible(self._can_edit_cliente)
         self.lbl_marked.setVisible(self._can_edit_cliente)
         self.btn_quick_edit.setVisible(self._can_edit_cliente)
+        self.btn_quick_renovar.setVisible(self._can_edit_cliente)
         self.btn_quick_cancel.setVisible(self._can_edit_cliente)
         self.btn_email_sel.setVisible(self._can_send_email)
         self.btn_quick_email.setVisible(self._can_send_email)
@@ -1423,12 +1420,14 @@ class ListarClientesView(QWidget):
         try:
             selected_visible = (
                 (not self.btn_editar_sel.isHidden())
+                or (not self.btn_renovar_sel.isHidden())
                 or (not self.btn_reajuste_sel.isHidden())
                 or (not self.btn_email_sel.isHidden())
             )
             batch_visible = (
                 (not self.btn_mark_visible.isHidden())
                 or (not self.btn_clear_marked.isHidden())
+                or (not self.btn_renovar_marked.isHidden())
                 or (not self.lbl_marked.isHidden())
             )
             critical_visible = (
@@ -1515,6 +1514,15 @@ class ListarClientesView(QWidget):
         self.btn_cancelar_sel.setToolTip("Cancelar plano do cliente selecionado")
         self.btn_cancelar_sel.clicked.connect(self._cancelar_plano_selecionado)
 
+        self.btn_renovar_sel = QPushButton("Renovar")
+        self.btn_renovar_sel.setObjectName("btnSecondary")
+        self.btn_renovar_sel.setFixedHeight(36)
+        self.btn_renovar_sel.setMinimumWidth(72)
+        self.btn_renovar_sel.setCursor(Qt.PointingHandCursor)
+        self.btn_renovar_sel.setAccessibleName("Renovar contrato do cliente selecionado")
+        self.btn_renovar_sel.setToolTip("Renovar contrato do cliente selecionado")
+        self.btn_renovar_sel.clicked.connect(self._renovar_contrato_selecionado)
+
         self.btn_excluir_sel = QPushButton("Excluir")
         self.btn_excluir_sel.setObjectName("btnDanger")
         self.btn_excluir_sel.setFixedHeight(36)
@@ -1558,6 +1566,14 @@ class ListarClientesView(QWidget):
         self.btn_clear_marked.setToolTip("Limpar seleção de clientes marcados")
         self.btn_clear_marked.clicked.connect(self._clear_marcados)
 
+        self.btn_renovar_marked = QPushButton("Renovar marcados")
+        self.btn_renovar_marked.setObjectName("btnSecondary")
+        self.btn_renovar_marked.setFixedHeight(32)
+        self.btn_renovar_marked.setMinimumWidth(92)
+        self.btn_renovar_marked.setCursor(Qt.PointingHandCursor)
+        self.btn_renovar_marked.setToolTip("Renovar contrato de todos os clientes marcados")
+        self.btn_renovar_marked.clicked.connect(self._renovar_marcados)
+
         self.lbl_marked = QLabel("Marcados: 0")
         self.lbl_marked.setObjectName("actionStripMeta")
 
@@ -1587,6 +1603,7 @@ class ListarClientesView(QWidget):
         self.lbl_group_selected.setObjectName("actionGroupTitle")
         grp_sel_l.addWidget(self.lbl_group_selected)
         grp_sel_l.addWidget(self.btn_editar_sel)
+        grp_sel_l.addWidget(self.btn_renovar_sel)
         grp_sel_l.addWidget(self.btn_reajuste_sel)
         grp_sel_l.addWidget(self.btn_email_sel)
 
@@ -1600,6 +1617,7 @@ class ListarClientesView(QWidget):
         grp_batch_l.addWidget(self.lbl_group_batch)
         grp_batch_l.addWidget(self.btn_mark_visible)
         grp_batch_l.addWidget(self.btn_clear_marked)
+        grp_batch_l.addWidget(self.btn_renovar_marked)
         grp_batch_l.addWidget(self.lbl_marked)
 
         self.grp_actions_critical = QFrame()
@@ -1924,13 +1942,15 @@ class ListarClientesView(QWidget):
 
         quick = QGridLayout(); quick.setHorizontalSpacing(10); quick.setVerticalSpacing(8)
         self.btn_quick_edit = QPushButton("Editar"); self.btn_quick_edit.setObjectName("btnSecondary"); self.btn_quick_edit.setFixedHeight(40); self.btn_quick_edit.setCursor(Qt.PointingHandCursor); self.btn_quick_edit.setAccessibleName("Editar cliente (painel lateral)"); self.btn_quick_edit.setToolTip("Editar cliente selecionado"); self.btn_quick_edit.clicked.connect(self._editar_selecionado)
+        self.btn_quick_renovar = QPushButton("Renovar"); self.btn_quick_renovar.setObjectName("btnSecondary"); self.btn_quick_renovar.setFixedHeight(40); self.btn_quick_renovar.setCursor(Qt.PointingHandCursor); self.btn_quick_renovar.setAccessibleName("Renovar contrato do cliente (painel lateral)"); self.btn_quick_renovar.setToolTip("Renovar contrato do cliente selecionado"); self.btn_quick_renovar.clicked.connect(self._renovar_contrato_selecionado)
         self.btn_quick_cancel = QPushButton("Cancelar"); self.btn_quick_cancel.setObjectName("btnDanger"); self.btn_quick_cancel.setFixedHeight(40); self.btn_quick_cancel.setCursor(Qt.PointingHandCursor); self.btn_quick_cancel.setAccessibleName("Cancelar plano do cliente (painel lateral)"); self.btn_quick_cancel.setToolTip("Cancelar plano do cliente selecionado"); self.btn_quick_cancel.clicked.connect(self._cancelar_plano_selecionado)
         self.btn_quick_email = QPushButton("E-mail"); self.btn_quick_email.setObjectName("btnAccentSoft"); self.btn_quick_email.setFixedHeight(40); self.btn_quick_email.setCursor(Qt.PointingHandCursor); self.btn_quick_email.setAccessibleName("Enviar e-mail para cliente (painel lateral)"); self.btn_quick_email.setToolTip("Enviar e-mail para cliente selecionado"); self.btn_quick_email.clicked.connect(self._enviar_email_selecionado)
         self.btn_quick_del  = QPushButton("Excluir"); self.btn_quick_del.setObjectName("btnDanger");    self.btn_quick_del.setFixedHeight(40);  self.btn_quick_del.setCursor(Qt.PointingHandCursor);  self.btn_quick_del.setAccessibleName("Excluir cliente (painel lateral)");  self.btn_quick_del.setToolTip("Excluir cliente selecionado");  self.btn_quick_del.clicked.connect(self._excluir_selecionado)
         quick.addWidget(self.btn_quick_edit, 0, 0)
-        quick.addWidget(self.btn_quick_email, 0, 1)
-        quick.addWidget(self.btn_quick_cancel, 1, 0)
-        quick.addWidget(self.btn_quick_del, 1, 1)
+        quick.addWidget(self.btn_quick_renovar, 0, 1)
+        quick.addWidget(self.btn_quick_email, 1, 0)
+        quick.addWidget(self.btn_quick_cancel, 1, 1)
+        quick.addWidget(self.btn_quick_del, 2, 0, 1, 2)
         quick.setColumnStretch(0, 1)
         quick.setColumnStretch(1, 1)
         sl.addLayout(quick); sl.addStretch()
@@ -2078,15 +2098,19 @@ class ListarClientesView(QWidget):
         if tiny:
             self.btn_novo.setText("+")
             self.btn_reajuste_sel.setText("Reaj.")
+            self.btn_renovar_sel.setText("Ren.")
             self.btn_cancelar_sel.setText("Canc.")
             self.btn_mark_visible.setMinimumWidth(72)
             self.btn_clear_marked.setMinimumWidth(72)
+            self.btn_renovar_marked.setMinimumWidth(76)
         else:
             self.btn_novo.setText("+ Novo")
             self.btn_reajuste_sel.setText("Reajuste")
+            self.btn_renovar_sel.setText("Renovar")
             self.btn_cancelar_sel.setText("Cancelar")
             self.btn_mark_visible.setMinimumWidth(92)
             self.btn_clear_marked.setMinimumWidth(98)
+            self.btn_renovar_marked.setMinimumWidth(120)
 
         self._sync_marcados_ui()
 
@@ -2097,8 +2121,10 @@ class ListarClientesView(QWidget):
     def _set_actions_enabled(self, enabled: bool):
         can_cancel = enabled and self._can_edit_cliente and self._current_status != "inativo"
         self.btn_editar_sel.setEnabled(enabled and self._can_edit_cliente)
+        self.btn_renovar_sel.setEnabled(enabled and self._can_edit_cliente)
         self.btn_cancelar_sel.setEnabled(can_cancel)
         self.btn_quick_edit.setEnabled(enabled and self._can_edit_cliente)
+        self.btn_quick_renovar.setEnabled(enabled and self._can_edit_cliente)
         self.btn_quick_cancel.setEnabled(can_cancel)
         self.btn_email_sel.setEnabled(enabled and self._can_send_email)
         self.btn_quick_email.setEnabled(enabled and self._can_send_email)
@@ -2125,6 +2151,9 @@ class ListarClientesView(QWidget):
             act_edit = QAction("Editar cliente", self)
             act_edit.triggered.connect(self._editar_selecionado)
             menu.addAction(act_edit)
+            act_renew = QAction("Renovar contrato", self)
+            act_renew.triggered.connect(self._renovar_contrato_selecionado)
+            menu.addAction(act_renew)
             act_cancel = QAction("Cancelar plano", self)
             act_cancel.setEnabled(status_row != "inativo")
             act_cancel.triggered.connect(self._cancelar_plano_selecionado)
@@ -2477,6 +2506,7 @@ class ListarClientesView(QWidget):
             self.btn_mark_visible.setText("Desmarcar visíveis" if all_marked else "Marcar visíveis")
             self.btn_clear_marked.setText("Limpar marcações")
         self.btn_clear_marked.setEnabled(total > 0)
+        self.btn_renovar_marked.setEnabled(total > 0 and self._can_edit_cliente)
 
     def _set_contract_btn(self, row: int, mat: int):
         wrap = QFrame()
@@ -2772,6 +2802,62 @@ class ListarClientesView(QWidget):
         self.cancelar_plano_signal.emit(int(self.current_mat))
         self._show_message(f"Solicitado cancelamento do plano MAT {self.current_mat}.", ok=True, ms=1800)
 
+    def _renovar_contrato_selecionado(self, *_):
+        if not self._can_edit_cliente:
+            self._show_message("Perfil de recepção não pode editar clientes.", ok=False)
+            return
+        if not self.current_mat:
+            self._show_message("Selecione um cliente primeiro.", ok=False)
+            return
+
+        nome_item = self.table.item(self.table.currentRow(), self.COL_NOME)
+        nome = nome_item.text() if nome_item else f"MAT {self.current_mat}"
+
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Renovar contrato")
+        dlg.setText(f"Deseja renovar o contrato do cliente <b>{nome}</b> (MAT {self.current_mat})?")
+        dlg.setInformativeText("A data de inicio sera atualizada para hoje e o plano sera reativado, se necessario.")
+        dlg.setIcon(QMessageBox.Question)
+        dlg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        dlg.setDefaultButton(QMessageBox.Cancel)
+        dlg.button(QMessageBox.Yes).setText("Renovar contrato")
+        dlg.button(QMessageBox.Cancel).setText("Voltar")
+
+        if dlg.exec() != QMessageBox.Yes:
+            return
+
+        self.renovar_contrato_signal.emit(int(self.current_mat))
+        self._show_message(f"Solicitada renovacao do contrato MAT {self.current_mat}.", ok=True, ms=1800)
+
+    def _renovar_marcados(self, *_):
+        if not self._can_edit_cliente:
+            self._show_message("Perfil de recepção não pode editar clientes.", ok=False)
+            return
+        ids = sorted(int(v) for v in self._checked_mats if int(v) > 0)
+        if not ids:
+            self._show_message("Marque ao menos um cliente para renovar.", ok=False)
+            return
+
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Renovar contratos em lote")
+        dlg.setText(f"Deseja renovar o contrato de {len(ids)} cliente(s) marcado(s)?")
+        dlg.setInformativeText("A data de inicio sera atualizada para hoje e clientes inativos serao reativados.")
+        dlg.setIcon(QMessageBox.Question)
+        dlg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        dlg.setDefaultButton(QMessageBox.Cancel)
+        dlg.button(QMessageBox.Yes).setText("Renovar em lote")
+        dlg.button(QMessageBox.Cancel).setText("Voltar")
+
+        if dlg.exec() != QMessageBox.Yes:
+            return
+
+        self.renovar_contratos_signal.emit(ids)
+        self._show_message(
+            f"Solicitada renovacao em lote para {len(ids)} cliente(s).",
+            ok=True,
+            ms=2200,
+        )
+
     def _abrir_reajuste_planos(self, *_):
         if not self._can_edit_cliente:
             self._show_message("Perfil de recepção não pode reajustar planos.", ok=False)
@@ -2974,7 +3060,7 @@ class ListarClientesView(QWidget):
     # ─────────────────────────────────────────
     def apply_styles(self):
         f = self._sans
-        self.setStyleSheet(f"""
+        base_qss = f"""
         /* ── raiz ────────────────────────────────────────────────────────── */
         QWidget#ListarClientes {{
             background: {_BG};
@@ -3524,4 +3610,7 @@ class ListarClientesView(QWidget):
             border-left: 4px solid {_GOOD};
             color: {_GOOD};
         }}
-        """)
+        """
+        self._base_qss = base_qss
+        self.setStyleSheet(base_qss)
+

@@ -6,6 +6,7 @@ import re
 import smtplib
 import ssl
 import base64
+import socket
 import unicodedata
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -13,6 +14,18 @@ from email.utils import formataddr, parseaddr
 
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_PLACEHOLDER_HINTS = (
+    "troque",
+    "defina",
+    "change_this",
+    "changeme",
+    "senha_de_app",
+    "senha_app",
+    "seu_email",
+    "example.com",
+    "seu_usuario",
+    "seu-usuario",
+)
 
 
 def _is_ascii(value: str) -> bool:
@@ -30,6 +43,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_flag_with_presence(name: str, default: bool = False) -> tuple[bool, bool]:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default), False
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}, True
+
+
 def _normalize_login(value: str) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -42,6 +62,15 @@ def _ascii_fold(value: str) -> str:
     txt = str(value or "")
     norm = unicodedata.normalize("NFKD", txt)
     return "".join(ch for ch in norm if ord(ch) < 128)
+
+
+def _is_placeholder_value(value: str) -> bool:
+    txt = str(value or "").strip().lower()
+    if not txt:
+        return True
+    if txt in {"usuario", "seu usuario", "seu_usuario", "host", "smtp.host", "smtp.example.com"}:
+        return True
+    return any(hint in txt for hint in _PLACEHOLDER_HINTS)
 
 
 @dataclass(frozen=True)
@@ -76,7 +105,8 @@ def load_smtp_config() -> SmtpConfig:
     raw_from = str(os.getenv("MEDCONTRACT_SMTP_FROM", "") or "").strip()
     parsed_name, parsed_addr = parseaddr(raw_from)
     from_email = (parsed_addr or raw_from or "").strip()
-    if not from_email:
+    if not from_email or _is_placeholder_value(from_email):
+        # Se MEDCONTRACT_SMTP_FROM estiver vazio/placeholder, usa o usuario SMTP.
         from_email = username
 
     raw_from_name = os.getenv("MEDCONTRACT_SMTP_FROM_NAME")
@@ -85,8 +115,16 @@ def load_smtp_config() -> SmtpConfig:
     else:
         from_name = str(raw_from_name or "").strip() or "MedContract"
 
-    use_ssl = _env_flag("MEDCONTRACT_SMTP_USE_SSL", default=False)
-    use_tls = _env_flag("MEDCONTRACT_SMTP_USE_TLS", default=not use_ssl)
+    use_ssl, has_ssl_flag = _env_flag_with_presence("MEDCONTRACT_SMTP_USE_SSL", default=False)
+    use_tls, has_tls_flag = _env_flag_with_presence("MEDCONTRACT_SMTP_USE_TLS", default=not use_ssl)
+    # Auto-ajuste quando os flags nao foram definidos explicitamente.
+    if not has_ssl_flag and not has_tls_flag:
+        if port == 465:
+            use_ssl = True
+            use_tls = False
+        elif port in {25, 587}:
+            use_ssl = False
+            use_tls = True
     if use_ssl:
         use_tls = False
 
@@ -143,6 +181,10 @@ def _validate_content(subject: str, body_text: str):
 def _validate_smtp_config(cfg: SmtpConfig):
     if not cfg.host:
         raise RuntimeError("Servidor SMTP nao configurado. " + smtp_config_help_text())
+    if _is_placeholder_value(cfg.host):
+        raise RuntimeError(
+            "Servidor SMTP com valor de exemplo. Configure MEDCONTRACT_SMTP_HOST com o host real."
+        )
     if not cfg.from_email:
         raise RuntimeError("E-mail remetente nao configurado. " + smtp_config_help_text())
     if not _EMAIL_RE.match(cfg.from_email) or not _is_ascii(cfg.from_email):
@@ -150,8 +192,26 @@ def _validate_smtp_config(cfg: SmtpConfig):
             "MEDCONTRACT_SMTP_FROM invalido. Use apenas o e-mail remetente "
             "(sem nome), por exemplo: contato@empresa.com."
         )
+    if cfg.username and _is_placeholder_value(cfg.username):
+        raise RuntimeError(
+            "MEDCONTRACT_SMTP_USER ainda esta com valor de exemplo. Informe o usuario SMTP real."
+        )
+    if _is_placeholder_value(cfg.from_email):
+        raise RuntimeError(
+            "MEDCONTRACT_SMTP_FROM ainda esta com valor de exemplo. Informe um remetente real."
+        )
     if cfg.username and not cfg.password:
         raise RuntimeError("Senha SMTP nao configurada. " + smtp_config_help_text())
+    if cfg.username and _is_placeholder_value(cfg.password):
+        raise RuntimeError(
+            "MEDCONTRACT_SMTP_PASSWORD ainda esta com valor de exemplo. Use a senha real (ou senha de app)."
+        )
+
+
+def validate_runtime_smtp_config() -> SmtpConfig:
+    cfg = load_smtp_config()
+    _validate_smtp_config(cfg)
+    return cfg
 
 
 def _smtp_login(smtp, username: str, password: str) -> None:
@@ -227,23 +287,43 @@ def send_email(
     html = (body_html or "").strip()
 
     context = ssl.create_default_context()
-    local_hostname = str(os.getenv("MEDCONTRACT_SMTP_LOCAL_HOSTNAME", "localhost") or "localhost").strip()
+    default_local_hostname = socket.getfqdn() or socket.gethostname() or "localhost.localdomain"
+    local_hostname = str(
+        os.getenv("MEDCONTRACT_SMTP_LOCAL_HOSTNAME", default_local_hostname) or default_local_hostname
+    ).strip()
     if not local_hostname or not _is_ascii(local_hostname):
-        local_hostname = "localhost"
+        local_hostname = "localhost.localdomain"
+    allow_plain_fallback = _env_flag("MEDCONTRACT_SMTP_ALLOW_PLAIN_FALLBACK", default=False)
 
-    try:
-        if cfg.use_ssl:
-            with smtplib.SMTP_SSL(
-                cfg.host,
-                cfg.port,
-                timeout=cfg.timeout_seconds,
-                context=context,
-                local_hostname=local_hostname,
-            ) as smtp:
-                smtp.ehlo()
-                _smtp_login(smtp, cfg.username, cfg.password)
-                _send_message_safe(smtp, cfg, to_addr, subj, body, html)
-        else:
+    modes: list[str] = []
+    if cfg.use_ssl:
+        modes.append("ssl")
+    else:
+        modes.append("starttls" if cfg.use_tls else "plain")
+        if cfg.use_tls and allow_plain_fallback:
+            modes.append("plain")
+        if cfg.port == 465 and "ssl" not in modes:
+            modes.append("ssl")
+
+    if not modes:
+        modes = ["plain"]
+
+    errors: list[str] = []
+    for mode in modes:
+        try:
+            if mode == "ssl":
+                with smtplib.SMTP_SSL(
+                    cfg.host,
+                    cfg.port,
+                    timeout=cfg.timeout_seconds,
+                    context=context,
+                    local_hostname=local_hostname,
+                ) as smtp:
+                    smtp.ehlo()
+                    _smtp_login(smtp, cfg.username, cfg.password)
+                    _send_message_safe(smtp, cfg, to_addr, subj, body, html)
+                return {"ok": True, "to": to_addr, "subject": subj}
+
             with smtplib.SMTP(
                 cfg.host,
                 cfg.port,
@@ -251,21 +331,17 @@ def send_email(
                 local_hostname=local_hostname,
             ) as smtp:
                 smtp.ehlo()
-                if cfg.use_tls:
+                if mode == "starttls":
+                    if not smtp.has_extn("starttls"):
+                        raise RuntimeError("Servidor SMTP nao oferece STARTTLS nesta porta.")
                     smtp.starttls(context=context)
                     smtp.ehlo()
                 _smtp_login(smtp, cfg.username, cfg.password)
                 _send_message_safe(smtp, cfg, to_addr, subj, body, html)
-    except UnicodeEncodeError as exc:
-        raise RuntimeError(
-            "Falha de codificacao no SMTP mesmo apos fallback. "
-            f"Detalhe tecnico: {exc}"
-        ) from exc
-    except Exception as exc:
-        raise RuntimeError(f"Falha ao enviar e-mail: {exc}") from exc
+            return {"ok": True, "to": to_addr, "subject": subj}
+        except UnicodeEncodeError as exc:
+            errors.append(f"{mode}: erro de codificacao ({exc})")
+        except Exception as exc:
+            errors.append(f"{mode}: {exc}")
 
-    return {
-        "ok": True,
-        "to": to_addr,
-        "subject": subj,
-    }
+    raise RuntimeError("Falha ao enviar e-mail. Tentativas: " + " | ".join(errors))

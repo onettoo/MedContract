@@ -2,7 +2,7 @@
 """
 Dashboard View - Modern SaaS Design
 Sistema de gestão clínica - Dashboard principal
-Paleta: Indigo (#6366f1) - Design premium e profissional
+Paleta: azul/teal profissional
 """
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QScrollArea,
     QSizePolicy,
-    QToolButton,
     QVBoxLayout,
     QWidget,
     QComboBox,
@@ -32,7 +31,6 @@ from PySide6.QtWidgets import (
 
 from utils import br_money
 from views.role_utils import normalize_role as _normalize_role
-from views.theme_manager import ThemeManager
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONSTANTS
@@ -98,100 +96,6 @@ class HeaderStrip(QFrame):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ALERT ITEM
-# ══════════════════════════════════════════════════════════════════════════════
-class AlertItem(QFrame):
-    """Individual alert notification with dismiss button."""
-    
-    dismissed = Signal(int)
-
-    def __init__(self, alert_id: int, severity: str, text: str):
-        super().__init__()
-        self.alert_id = int(alert_id)
-        sev = str(severity or "info").strip().lower()
-        if sev not in {"danger", "warn", "good", "info"}:
-            sev = "info"
-        self.setObjectName("alertItem")
-        self.setProperty("severity", sev)
-
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 9, 12, 9)
-        lay.setSpacing(8)
-
-        icon = QLabel({"danger": "⛔", "warn": "⚠️", "good": "✅", "info": "ℹ️"}.get(sev, "ℹ️"))
-        icon.setObjectName("alertIcon")
-        
-        msg = QLabel(str(text or "").strip())
-        msg.setObjectName("alertText")
-        msg.setWordWrap(True)
-        
-        btn = QToolButton()
-        btn.setObjectName("alertDismiss")
-        btn.setText("✕")
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.clicked.connect(lambda: self.dismissed.emit(self.alert_id))
-
-        lay.addWidget(icon)
-        lay.addWidget(msg, 1)
-        lay.addWidget(btn)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ALERTS PANEL
-# ══════════════════════════════════════════════════════════════════════════════
-class AlertsPanel(QFrame):
-    """Container for alert notifications."""
-    
-    def __init__(self):
-        super().__init__()
-        self.setObjectName("alertsPanel")
-        self._next_id = 1
-        self._alerts: dict[int, AlertItem] = {}
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-
-        self._title = QLabel("🔔 Alertas operacionais")
-        self._title.setObjectName("alertsPanelTitle")
-        lay.addWidget(self._title)
-
-        self._container = QVBoxLayout()
-        self._container.setSpacing(4)
-        lay.addLayout(self._container)
-        self.setVisible(False)
-
-    def _refresh_title(self):
-        count = len(self._alerts)
-        self._title.setText(f"🔔 Alertas operacionais ({count})" if count > 0 else "🔔 Alertas operacionais")
-        self.setVisible(bool(self._alerts))
-
-    def add_alert(self, severity: str, text: str) -> int:
-        aid = self._next_id
-        self._next_id += 1
-        item = AlertItem(aid, severity, text)
-        item.dismissed.connect(self._remove)
-        self._alerts[aid] = item
-        self._container.addWidget(item)
-        self._refresh_title()
-        return aid
-
-    def _remove(self, aid: int):
-        item = self._alerts.pop(int(aid), None)
-        if item:
-            self._container.removeWidget(item)
-            item.deleteLater()
-        self._refresh_title()
-
-    def clear_alerts(self):
-        for item in list(self._alerts.values()):
-            self._container.removeWidget(item)
-            item.deleteLater()
-        self._alerts.clear()
-        self._refresh_title()
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # METRIC CARD (Status Chips)
 # ══════════════════════════════════════════════════════════════════════════════
 class MetricCard(QFrame):
@@ -211,7 +115,7 @@ class MetricCard(QFrame):
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(16)
         shadow.setOffset(0, 4)
-        shadow.setColor(QColor(99, 102, 241, 30))
+        shadow.setColor(QColor(22, 78, 126, 30))
         self.setGraphicsEffect(shadow)
         
         lay = QHBoxLayout(self)
@@ -279,7 +183,7 @@ class LiveMetricCard(QFrame):
         shadow = QGraphicsDropShadowEffect(self)
         shadow.setBlurRadius(16)
         shadow.setOffset(0, 4)
-        shadow.setColor(QColor(99, 102, 241, 30))
+        shadow.setColor(QColor(22, 78, 126, 30))
         self.setGraphicsEffect(shadow)
         
         lay = QVBoxLayout(self)
@@ -340,7 +244,7 @@ class CardButton(QFrame):
         self.shadow = QGraphicsDropShadowEffect(self)
         self.shadow.setBlurRadius(14)
         self.shadow.setOffset(0, 6)
-        self.shadow.setColor(QColor(99, 102, 241, 30))
+        self.shadow.setColor(QColor(22, 78, 126, 28))
         self.setGraphicsEffect(self.shadow)
         
         lay = QVBoxLayout(self)
@@ -377,13 +281,13 @@ class CardButton(QFrame):
         if self.isEnabled():
             self._hovered = True
             self.shadow.setBlurRadius(24)
-            self.shadow.setColor(QColor(99, 102, 241, 50))
+            self.shadow.setColor(QColor(22, 78, 126, 44))
 
     def leaveEvent(self, event):
         super().leaveEvent(event)
         self._hovered = False
         self.shadow.setBlurRadius(14)
-        self.shadow.setColor(QColor(99, 102, 241, 30))
+        self.shadow.setColor(QColor(22, 78, 126, 28))
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton and self.isEnabled():
@@ -397,7 +301,7 @@ class CardButton(QFrame):
 class DashboardView(QWidget):
     """
     Dashboard principal modernizado com design SaaS premium.
-    Paleta: Indigo (#6366f1) - Design profissional e responsivo.
+    Paleta azul/teal profissional e responsiva.
     """
     
     # ──────────────────────────────────────────────────────────────────────────
@@ -411,11 +315,13 @@ class DashboardView(QWidget):
     ir_financeiro_signal = Signal()
     ir_cadastro_empresa_signal = Signal()
     ir_listar_empresas_signal = Signal()
+    ir_relatorios_signal = Signal()
     ir_listar_filtrado_signal = Signal(str, str, str)
     busca_global_signal = Signal(str)
     export_clientes_signal = Signal()
     export_inadimplentes_signal = Signal()
     export_pagamentos_mes_signal = Signal()
+    backup_now_signal = Signal()
     refresh_signal = Signal()
     period_changed_signal = Signal(str)
 
@@ -425,6 +331,7 @@ class DashboardView(QWidget):
         self._is_recepcao = False
         self._is_loading = False
         self._last_updated_at: Optional[datetime] = None
+        self._density_mode = "normal"
 
         # Timers
         self._clock_timer = QTimer(self)
@@ -438,10 +345,6 @@ class DashboardView(QWidget):
         self._error_clear_timer = QTimer(self)
         self._error_clear_timer.setSingleShot(True)
         self._error_clear_timer.timeout.connect(self._hide_error)
-
-        # Theme manager
-        self.theme_manager = ThemeManager()
-        self.theme_manager.theme_changed.connect(self._apply_theme)
 
         self._setup_ui()
         self.apply_styles()
@@ -479,6 +382,7 @@ class DashboardView(QWidget):
         cl = QVBoxLayout(content)
         cl.setContentsMargins(14, 10, 14, 14)
         cl.setSpacing(10)
+        self._content_layout = cl
 
         # Error banner
         self.error_banner = QLabel("")
@@ -486,10 +390,6 @@ class DashboardView(QWidget):
         self.error_banner.setWordWrap(True)
         self.error_banner.setVisible(False)
         cl.addWidget(self.error_banner)
-
-        # Alerts panel
-        self.alerts_panel = AlertsPanel()
-        cl.addWidget(self.alerts_panel)
 
         # Quick search
         cl.addWidget(self._build_quick_search())
@@ -521,6 +421,7 @@ class DashboardView(QWidget):
         top = QHBoxLayout(topbar)
         top.setContentsMargins(14, 8, 14, 8)
         top.setSpacing(8)
+        self._topbar_layout = top
 
         # Title section
         col = QVBoxLayout()
@@ -609,6 +510,7 @@ class DashboardView(QWidget):
         """Build status metrics row."""
         row = QHBoxLayout()
         row.setSpacing(8)
+        self._status_metrics_layout = row
         
         self.metric_ativos = MetricCard("Clientes ativos", "🟢")
         self.metric_atrasados = MetricCard("Pagamentos atrasados", "🟠")
@@ -629,6 +531,7 @@ class DashboardView(QWidget):
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(8)
+        self._live_metrics_layout = grid
         
         self.live_total = LiveMetricCard("Total de clientes", "👥")
         self.live_empresas = LiveMetricCard("Contratos de empresa", "🏢")
@@ -646,6 +549,7 @@ class DashboardView(QWidget):
         """Build main content layout (sidebar + action cards)."""
         body = QHBoxLayout()
         body.setSpacing(10)
+        self._main_content_layout = body
 
         # Left sidebar
         left = self._build_sidebar()
@@ -661,8 +565,9 @@ class DashboardView(QWidget):
         """Build left sidebar with exports and summary."""
         left = QFrame()
         left.setObjectName("leftPanel")
-        left.setMinimumWidth(274)
-        left.setMaximumWidth(320)
+        left.setMinimumWidth(342)
+        left.setMaximumWidth(410)
+        self._left_panel = left
         
         ll = QVBoxLayout(left)
         ll.setContentsMargins(12, 12, 12, 12)
@@ -672,15 +577,63 @@ class DashboardView(QWidget):
         brand = QLabel("💼 Pronto Clínica")
         brand.setObjectName("brand")
         
-        welcome = QLabel("Bem-vindo")
-        welcome.setObjectName("welcome")
+        self.welcome_lbl = QLabel("Bem-vindo")
+        self.welcome_lbl.setObjectName("welcome")
         
         self.status_lbl = QLabel("—")
         self.status_lbl.setObjectName("statusLine")
         
         ll.addWidget(brand)
-        ll.addWidget(welcome)
+        ll.addWidget(self.welcome_lbl)
         ll.addWidget(self.status_lbl)
+
+        # Quick hub (left highlighted card)
+        hub_card = QFrame()
+        hub_card.setObjectName("hubCard")
+        hub = QVBoxLayout(hub_card)
+        hub.setContentsMargins(11, 11, 11, 11)
+        hub.setSpacing(6)
+
+        self.lbl_hub_title = QLabel("Avisos de contas a pagar")
+        self.lbl_hub_title.setObjectName("hubTitle")
+
+        self.hub_alert_card = QFrame()
+        self.hub_alert_card.setObjectName("hubAlertCard")
+        self.hub_alert_card.setProperty("tone", "warn")
+        hub_alert = QVBoxLayout(self.hub_alert_card)
+        hub_alert.setContentsMargins(9, 8, 9, 8)
+        hub_alert.setSpacing(3)
+        self.lbl_hub_alert_title = QLabel("⚠ Contas a pagar")
+        self.lbl_hub_alert_title.setObjectName("hubAlertTitle")
+        self.lbl_hub_alert_body = QLabel("Hoje: — · Próximos 7 dias: —")
+        self.lbl_hub_alert_body.setObjectName("hubAlertBody")
+        self.lbl_hub_alert_body.setWordWrap(True)
+        hub_alert.addWidget(self.lbl_hub_alert_title)
+        hub_alert.addWidget(self.lbl_hub_alert_body)
+
+        hub.addWidget(self.lbl_hub_title)
+        hub.addWidget(self.hub_alert_card)
+        ll.addWidget(hub_card)
+
+        # Operational pending box
+        box_pending = QFrame()
+        box_pending.setObjectName("quickBox")
+        pl = QVBoxLayout(box_pending)
+        pl.setContentsMargins(9, 9, 9, 9)
+        pl.setSpacing(3)
+
+        pt = QLabel("📌 Pendências operacionais")
+        pt.setObjectName("quickTitle")
+        pl.addWidget(pt)
+
+        self._pending_labels: list[QLabel] = []
+        for _ in range(4):
+            lbl = QLabel("—")
+            lbl.setObjectName("quickLineMuted")
+            lbl.setWordWrap(True)
+            self._pending_labels.append(lbl)
+            pl.addWidget(lbl)
+        ll.addWidget(box_pending)
 
         # Exports box
         box_exp = QFrame()
@@ -704,10 +657,15 @@ class DashboardView(QWidget):
         self.btn_exp_pagmes = QPushButton("🧾 Exportar pagamentos")
         self.btn_exp_pagmes.setObjectName("btnQuick")
         self.btn_exp_pagmes.clicked.connect(self.export_pagamentos_mes_signal.emit)
-        
+
+        self.btn_backup_now = QPushButton("💾 Backup agora")
+        self.btn_backup_now.setObjectName("btnQuick")
+        self.btn_backup_now.clicked.connect(self.backup_now_signal.emit)
+
         ex.addWidget(self.btn_exp_clientes)
         ex.addWidget(self.btn_exp_inad)
         ex.addWidget(self.btn_exp_pagmes)
+        ex.addWidget(self.btn_backup_now)
         ll.addWidget(box_exp)
 
         # Summary box
@@ -744,22 +702,6 @@ class DashboardView(QWidget):
         sep1.setFixedHeight(1)
         rs.addWidget(sep1)
 
-        # Export history
-        ht = QLabel("📝 Histórico de exportações")
-        ht.setObjectName("quickTitle")
-        rs.addWidget(ht)
-
-        self._history_container = QVBoxLayout()
-        self._history_container.setSpacing(2)
-        rs.addLayout(self._history_container)
-        self._populate_placeholder_labels(self._history_container, 3)
-
-        # Sidebar section separator
-        sep2 = QFrame()
-        sep2.setObjectName("sidebarSep")
-        sep2.setFixedHeight(1)
-        rs.addWidget(sep2)
-
         # Jobs status
         jt = QLabel("⚙️ Jobs do sistema")
         jt.setObjectName("quickTitle")
@@ -782,22 +724,6 @@ class DashboardView(QWidget):
         rs.addWidget(self.lbl_job_lembrete)
         rs.addWidget(self.lbl_job_export)
 
-        # Sidebar section separator
-        sep3 = QFrame()
-        sep3.setObjectName("sidebarSep")
-        sep3.setFixedHeight(1)
-        rs.addWidget(sep3)
-
-        # Recent activities
-        at = QLabel("🕐 Atividades recentes")
-        at.setObjectName("quickTitle")
-        rs.addWidget(at)
-
-        self._activity_container = QVBoxLayout()
-        self._activity_container.setSpacing(2)
-        rs.addLayout(self._activity_container)
-        self._populate_placeholder_labels(self._activity_container, 3)
-
         ll.addWidget(box_resume)
         ll.addStretch()
 
@@ -812,32 +738,51 @@ class DashboardView(QWidget):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(6)
         
-        rl.addWidget(HeaderStrip("⚡ Ações rápidas"))
+        rl.addWidget(HeaderStrip("⚡ Ações rápidas", right_text="Cadastros · Financeiro · Operação"))
+
+        action_hint = QLabel("Ordem sugerida para rotina diária: cadastro, pagamento, acompanhamento financeiro e gestão de empresas.")
+        action_hint.setObjectName("actionHint")
+        action_hint.setWordWrap(True)
+        rl.addWidget(action_hint)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(6)
         
-        self.btn_novo_contrato = CardButton("Novo Contrato", "Fluxo guiado em etapas com revisão final.", "🧭")
-        self.btn_pagamento = CardButton("Registrar Pagamento", "Lançar pagamento e atualizar status.", "💳")
-        self.btn_listar = CardButton("Listar Clientes", "Consultar associados com filtros avançados.", "📋")
-        self.btn_financeiro = CardButton("Financeiro", "Painel de fluxo de caixa e relatórios.", "💼")
-        self.btn_empresa_cadastrar = CardButton("Cadastrar Empresa", "Adicionar novo contrato empresarial.", "🏢")
-        self.btn_empresa_listar = CardButton("Empresas", "Consultar e editar empresas cadastradas.", "🏛️")
+        self.btn_novo_contrato = CardButton("＋ Novo Cliente", "Iniciar cadastro completo e contrato em poucos passos.", "🧭")
+        self.btn_pagamento = CardButton("Registrar Pagamento", "Lançar pagamento confirmado e atualizar situação do cliente.", "💳")
+        self.btn_financeiro = CardButton("Visão Financeira", "Abrir painel com fluxo de caixa, métricas e exportações.", "💼")
+        self.btn_listar = CardButton("Clientes e Contratos", "Consultar carteira de clientes com filtros e ações rápidas.", "📋")
+        self.btn_empresa_cadastrar = CardButton("＋ Nova Empresa Parceira", "Cadastrar empresa conveniada com dados financeiros.", "🏢")
+        self.btn_empresa_listar = CardButton("Empresas Parceiras", "Listar, editar e acompanhar empresas cadastradas.", "🏛️")
+        self.btn_relatorios = CardButton("Relatórios do Sistema", "Abrir central de relatórios e arquivos gerados.", "🗂️")
+
+        # Hierarquia visual premium por contexto de ação
+        self.btn_novo_contrato.setProperty("tone", "core")
+        self.btn_novo_contrato.setProperty("featured", "true")
+        self.btn_pagamento.setProperty("tone", "cash")
+        self.btn_pagamento.setProperty("featured", "true")
+        self.btn_listar.setProperty("tone", "ops")
+        self.btn_financeiro.setProperty("tone", "finance")
+        self.btn_empresa_cadastrar.setProperty("tone", "biz")
+        self.btn_empresa_listar.setProperty("tone", "ops")
+        self.btn_relatorios.setProperty("tone", "ops")
         
         self.btn_novo_contrato.clicked.connect(self.ir_novo_contrato_signal.emit)
         self.btn_pagamento.clicked.connect(self.ir_pagamento_signal.emit)
-        self.btn_listar.clicked.connect(self.ir_listar_signal.emit)
         self.btn_financeiro.clicked.connect(self.ir_financeiro_signal.emit)
+        self.btn_listar.clicked.connect(self.ir_listar_signal.emit)
         self.btn_empresa_cadastrar.clicked.connect(self.ir_cadastro_empresa_signal.emit)
         self.btn_empresa_listar.clicked.connect(self.ir_listar_empresas_signal.emit)
+        self.btn_relatorios.clicked.connect(self.ir_relatorios_signal.emit)
 
         grid.addWidget(self.btn_novo_contrato, 0, 0)
-        grid.addWidget(self.btn_pagamento, 0, 1)
+        grid.addWidget(self.btn_empresa_cadastrar, 0, 1)
         grid.addWidget(self.btn_listar, 1, 0)
-        grid.addWidget(self.btn_financeiro, 1, 1)
-        grid.addWidget(self.btn_empresa_cadastrar, 2, 0)
-        grid.addWidget(self.btn_empresa_listar, 2, 1)
+        grid.addWidget(self.btn_empresa_listar, 1, 1)
+        grid.addWidget(self.btn_pagamento, 2, 0)
+        grid.addWidget(self.btn_financeiro, 2, 1)
+        grid.addWidget(self.btn_relatorios, 3, 0, 1, 2)
         
         rl.addLayout(grid)
 
@@ -850,19 +795,90 @@ class DashboardView(QWidget):
         """Apply QSS stylesheet from file."""
         style_path = Path(__file__).parent / "styles" / "dashboard.qss"
         if style_path.exists():
-            with open(style_path, "r") as f:
-                stylesheet = f.read()
+            stylesheet = ""
+            try:
+                stylesheet = style_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                try:
+                    stylesheet = style_path.read_text(encoding="utf-8-sig")
+                except Exception:
+                    stylesheet = style_path.read_text(encoding="latin-1")
+            except Exception:
+                stylesheet = ""
+            if stylesheet:
                 self.setStyleSheet(stylesheet)
         else:
             # Fallback if file not found
             pass
 
-    def _apply_theme(self, theme: str):
-        """Apply theme stylesheet and update property."""
-        self.setProperty("theme", theme)
-        self.style().unpolish(self)
-        self.apply_styles()
-        self.style().polish(self)
+    def set_density(self, density: str):
+        mode = str(density or "").strip().lower()
+        if mode not in {"normal", "compact"}:
+            mode = "normal"
+        self._density_mode = mode
+        compact = mode == "compact"
+
+        try:
+            if hasattr(self, "_topbar_layout"):
+                if compact:
+                    self._topbar_layout.setContentsMargins(10, 6, 10, 6)
+                    self._topbar_layout.setSpacing(6)
+                else:
+                    self._topbar_layout.setContentsMargins(14, 8, 14, 8)
+                    self._topbar_layout.setSpacing(8)
+            if hasattr(self, "_content_layout"):
+                if compact:
+                    self._content_layout.setContentsMargins(10, 8, 10, 10)
+                    self._content_layout.setSpacing(8)
+                else:
+                    self._content_layout.setContentsMargins(14, 10, 14, 14)
+                    self._content_layout.setSpacing(10)
+            if hasattr(self, "_main_content_layout"):
+                self._main_content_layout.setSpacing(8 if compact else 10)
+            if hasattr(self, "_status_metrics_layout"):
+                self._status_metrics_layout.setSpacing(6 if compact else 8)
+            if hasattr(self, "_live_metrics_layout"):
+                self._live_metrics_layout.setHorizontalSpacing(6 if compact else 8)
+                self._live_metrics_layout.setVerticalSpacing(6 if compact else 8)
+            if hasattr(self, "_left_panel"):
+                if compact:
+                    self._left_panel.setMinimumWidth(320)
+                    self._left_panel.setMaximumWidth(380)
+                else:
+                    self._left_panel.setMinimumWidth(342)
+                    self._left_panel.setMaximumWidth(410)
+        except Exception:
+            return
+
+        metric_h = 62 if compact else 70
+        live_h = 68 if compact else 78
+        action_h = 68 if compact else 76
+        for card in (
+            getattr(self, "metric_ativos", None),
+            getattr(self, "metric_atrasados", None),
+            getattr(self, "metric_inativos", None),
+        ):
+            if card is not None:
+                card.setMinimumHeight(metric_h)
+        for card in (
+            getattr(self, "live_total", None),
+            getattr(self, "live_empresas", None),
+            getattr(self, "live_qtd_pag", None),
+            getattr(self, "live_atraso", None),
+        ):
+            if card is not None:
+                card.setMinimumHeight(live_h)
+        for card in (
+            getattr(self, "btn_novo_contrato", None),
+            getattr(self, "btn_pagamento", None),
+            getattr(self, "btn_listar", None),
+            getattr(self, "btn_financeiro", None),
+            getattr(self, "btn_empresa_cadastrar", None),
+            getattr(self, "btn_empresa_listar", None),
+            getattr(self, "btn_relatorios", None),
+        ):
+            if card is not None:
+                card.setMinimumHeight(action_h)
 
     # ──────────────────────────────────────────────────────────────────────────
     # EVENT HANDLERS
@@ -879,21 +895,33 @@ class DashboardView(QWidget):
             if w:
                 w.deleteLater()
 
-    def _populate_placeholder_labels(self, layout, count: int = 3):
-        """Fill a layout with placeholder muted labels."""
-        self._clear_layout(layout)
-        for _ in range(count):
-            lbl = QLabel("—")
-            lbl.setObjectName("quickLineMuted")
-            lbl.setWordWrap(True)
-            layout.addWidget(lbl)
-
     def _on_period_changed(self):
         p = self.period_combo.currentData()
         if p not in (PERIOD_MONTH, PERIOD_7D, PERIOD_TODAY):
             p = PERIOD_MONTH
         self.period_changed_signal.emit(p)
         self.refresh_signal.emit()
+
+    def current_period(self) -> str:
+        p = self.period_combo.currentData()
+        if p not in (PERIOD_MONTH, PERIOD_7D, PERIOD_TODAY):
+            return PERIOD_MONTH
+        return str(p)
+
+    def set_period(self, period_key: str, *, emit_signal: bool = False):
+        target = str(period_key or "").strip().lower()
+        if target not in (PERIOD_MONTH, PERIOD_7D, PERIOD_TODAY):
+            target = PERIOD_MONTH
+        idx = 0
+        for i in range(self.period_combo.count()):
+            if str(self.period_combo.itemData(i) or "") == target:
+                idx = i
+                break
+        self.period_combo.blockSignals(True)
+        self.period_combo.setCurrentIndex(idx)
+        self.period_combo.blockSignals(False)
+        if emit_signal:
+            self.period_changed_signal.emit(target)
 
     def _do_quick_search(self):
         query = (self.search_input.text() or "").strip()
@@ -950,6 +978,10 @@ class DashboardView(QWidget):
             w.setVisible(not restricted)
             w.setEnabled(not restricted)
 
+        can_backup = role == "admin"
+        self.btn_backup_now.setVisible(can_backup)
+        self.btn_backup_now.setEnabled(can_backup and not self._is_loading)
+
         self.btn_financeiro.setVisible(not restricted)
         self.btn_financeiro.setEnabled(role not in {"funcionario", "recepcao"})
 
@@ -964,6 +996,8 @@ class DashboardView(QWidget):
         self.nivel_usuario = str(nivel or "")
         role = _normalize_role(nivel)
         self._is_recepcao = role == "recepcao"
+        role_label = str(self.nivel_usuario or "usuário").strip().upper()
+        self.welcome_lbl.setText(f"Bem-vindo, {role_label}")
         self._apply_role_restrictions()
 
     def set_refresh_state(self, loading: bool, message: Optional[str] = None):
@@ -975,9 +1009,11 @@ class DashboardView(QWidget):
         else:
             self.loading_bar.stop()
             
-        for w in (self.btn_refresh, self.period_combo, self.search_input, 
+        for w in (self.btn_refresh, self.period_combo, self.search_input,
                   self.btn_buscar, self.btn_atrasados, self.btn_ativos):
             w.setEnabled(not self._is_loading)
+        if hasattr(self, "btn_backup_now"):
+            self.btn_backup_now.setEnabled((not self._is_loading) and self.btn_backup_now.isVisible())
             
         self.btn_refresh.setText("🔄 Atualizando..." if self._is_loading else "🔄 Atualizar")
         
@@ -996,12 +1032,14 @@ class DashboardView(QWidget):
         self._error_clear_timer.start(max(1500, int(timeout_ms)))
 
     def add_alert(self, severity: str, text: str) -> int:
-        """Add alert to alerts panel."""
-        return self.alerts_panel.add_alert(severity, text)
+        """Compat shim after dashboard alert panel removal."""
+        _ = severity
+        _ = text
+        return 0
 
     def clear_alerts(self):
-        """Clear all alerts."""
-        self.alerts_panel.clear_alerts()
+        """Compat shim after dashboard alert panel removal."""
+        return
 
     def set_status_counts(self, ativos: int, atrasados: int, inativos: int):
         """Update status count metrics."""
@@ -1032,17 +1070,33 @@ class DashboardView(QWidget):
         qtd = int(data.get("pagamentos_mes", 0) or 0)
         atraso = float(data.get("atraso_estimado", 0.0) or 0.0)
         desc = str(data.get("periodo_desc", "") or "Período selecionado")
-        
-        self.live_total.set_value(str(total), desc)
-        self.live_empresas.set_value(str(empresas), desc)
-        self.live_qtd_pag.set_value(str(qtd), desc)
-        self.live_atraso.set_value(br_money(atraso), "Somatório dos atrasados")
-        
+        contratos_mes = int(data.get("contratos_mes", 0) or 0)
+        contratos_prev = int(data.get("contratos_prev", 0) or 0)
+        empresa_ativos = int(data.get("contratos_empresa_ativos", 0) or 0)
+        empresa_atrasados = int(data.get("contratos_empresa_atrasados", 0) or 0)
+        cobertura_pct = float(data.get("cobertura_pagamentos_pct", 0.0) or 0.0)
+        cobertura_meta = float(data.get("meta_cobertura_pagamentos_pct", 85.0) or 85.0)
+        atraso_ratio_pct = float(data.get("atraso_ratio_pct", 0.0) or 0.0)
+        atraso_meta_pct = float(data.get("meta_atraso_pct", 10.0) or 10.0)
+
+        contratos_delta = contratos_mes - contratos_prev
+        delta_prefix = "+" if contratos_delta > 0 else ""
+        self.live_total.set_value(str(total), f"{desc} · novos: {contratos_mes} ({delta_prefix}{contratos_delta})")
+        self.live_empresas.set_value(str(empresas), f"Ativas: {empresa_ativos} · em risco: {empresa_atrasados}")
+        self.live_qtd_pag.set_value(
+            str(qtd),
+            f"Cobertura: {cobertura_pct:.1f}% (meta {cobertura_meta:.0f}%)",
+        )
+        self.live_atraso.set_value(
+            br_money(atraso),
+            f"Risco da carteira: {atraso_ratio_pct:.1f}% (meta <= {atraso_meta_pct:.0f}%)",
+        )
+
         self.live_total.set_severity("good" if total > 0 else "neutral")
         self.live_empresas.set_severity("good" if empresas > 0 else "neutral")
-        self.live_qtd_pag.set_severity("good" if qtd > 0 else "neutral")
-        self.live_atraso.set_severity("danger" if atraso > 0 else "neutral")
-        
+        self.live_qtd_pag.set_severity("good" if cobertura_pct >= cobertura_meta else "warn")
+        self.live_atraso.set_severity("danger" if atraso_ratio_pct > atraso_meta_pct else ("warn" if atraso > 0 else "neutral"))
+
         self._mark_updated()
 
     def set_resumo_do_dia(self, resumo: dict):
@@ -1054,6 +1108,30 @@ class DashboardView(QWidget):
         self.lbl_novos_mes.setText(f"Novos no período: {data.get('novos_mes', '—')}")
         self.lbl_ult_backup.setText(f"Último backup: {data.get('ultimo_backup', '—')}")
 
+        contas_hoje = int(data.get("contas_pagar_hoje", 0) or 0)
+        contas_semana = int(data.get("contas_pagar_semana", 0) or 0)
+        contas_vencidas = int(data.get("contas_pagar_vencidas", 0) or 0)
+
+        self.lbl_hub_title.setText("Avisos de contas a pagar")
+
+        if contas_vencidas > 0:
+            tone = "danger"
+            self.lbl_hub_alert_title.setText("⛔ Contas pendentes críticas")
+        elif contas_hoje > 0 or contas_semana > 0:
+            tone = "warn"
+            self.lbl_hub_alert_title.setText("⚠ Contas a pagar")
+        else:
+            tone = "ok"
+            self.lbl_hub_alert_title.setText("✅ Contas sob controle")
+        self.hub_alert_card.setProperty("tone", tone)
+        self.hub_alert_card.style().unpolish(self.hub_alert_card)
+        self.hub_alert_card.style().polish(self.hub_alert_card)
+        self.lbl_hub_alert_body.setText(
+            f"Hoje: {contas_hoje} · Próximos 7 dias: {contas_semana} · Vencidas: {contas_vencidas}"
+        )
+
+        self.set_pendencias_operacionais(data.get("pendencias_operacionais", []))
+
         if not self._is_recepcao:
             self.lbl_ult_export.setText(f"Última exportação: {data.get('ultima_export', '—')}")
 
@@ -1061,53 +1139,36 @@ class DashboardView(QWidget):
         self._mark_updated()
 
     def set_export_history(self, entries: list[dict]):
-        """Update export history list."""
-        self._clear_layout(self._history_container)
-
-        if self._is_recepcao:
-            lbl = QLabel("—")
-            lbl.setObjectName("quickLineMuted")
-            self._history_container.addWidget(lbl)
-            return
-
-        items = list(entries or [])
-        if not items:
-            lbl = QLabel("Nenhuma exportação registrada")
-            lbl.setObjectName("quickLineMuted")
-            self._history_container.addWidget(lbl)
-            return
-
-        for it in items:
-            it = dict(it or {})
-            ok = bool(it.get("ok", True))
-            lbl = QLabel(f"{it.get('when', '—')}  {'✓' if ok else '✗'}  {it.get('action', '—')}")
-            lbl.setObjectName("quickLine" if ok else "quickLineWarn")
-            lbl.setWordWrap(True)
-            self._history_container.addWidget(lbl)
+        """Compat shim after export-history section removal."""
+        _ = entries
+        return
 
     def set_recent_activities(self, entries: list[dict]):
-        """Update recent activities list."""
-        self._clear_layout(self._activity_container)
+        """Compat shim after recent-activities section removal."""
+        _ = entries
+        return
 
-        items = list(entries or [])
-        if not items:
-            lbl = QLabel("Nenhuma atividade recente")
-            lbl.setObjectName("quickLineMuted")
-            self._activity_container.addWidget(lbl)
-            return
+    def set_pendencias_operacionais(self, entries: list[str]):
+        """Render operational pending list in sidebar."""
+        rows = [str(x or "").strip() for x in list(entries or []) if str(x or "").strip()]
+        if not rows:
+            rows = ["Sem pendências críticas no momento."]
+        rows = rows[: len(self._pending_labels)]
 
-        for it in items:
-            it = dict(it or {})
-            title = str(it.get("title", "—") or "—").strip()
-            when = str(it.get("when", "—") or "—").strip()
-            detail = str(it.get("detail", "") or "").strip()
-            txt = f"{when} · {title}" + (f" · {detail}" if detail else "")
-
-            level = str(it.get("level", "info") or "info").lower()
-            lbl = QLabel(txt)
-            lbl.setObjectName("quickLineWarn" if level in {"warn", "warning", "error", "failed"} else "quickLine")
-            lbl.setWordWrap(True)
-            self._activity_container.addWidget(lbl)
+        for idx, lbl in enumerate(self._pending_labels):
+            if idx < len(rows):
+                txt = rows[idx]
+                lbl.setText(f"• {txt}")
+                low = txt.lower()
+                if any(k in low for k in ("vencid", "atras", "pendent", "risco")):
+                    lbl.setObjectName("quickLineWarn")
+                else:
+                    lbl.setObjectName("quickLine")
+            else:
+                lbl.setText("—")
+                lbl.setObjectName("quickLineMuted")
+            lbl.style().unpolish(lbl)
+            lbl.style().polish(lbl)
 
     def set_jobs_status(self, payload: dict):
         """Update system jobs status."""

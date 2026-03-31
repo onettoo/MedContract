@@ -27,11 +27,11 @@ from PySide6.QtWidgets import (
 from views.cadastro_cliente_view import ViaCepService, only_digits
 
 
-# Modern SaaS Color Palette
-_ACCENT = "#6366f1"  # Vibrant indigo
-_ACCENT_HOVER = "#4f46e5"
-_ACCENT_LIGHT = "rgba(99,102,241,0.10)"
-_ACCENT_BORDER = "rgba(99,102,241,0.30)"
+# Modern SaaS Color Palette (alinhada ao dashboard)
+_ACCENT = "#1a6b7c"
+_ACCENT_HOVER = "#155e6d"
+_ACCENT_LIGHT = "rgba(26,107,124,0.10)"
+_ACCENT_BORDER = "rgba(26,107,124,0.30)"
 _INK = "#0f172a"  # Deep slate
 _INK2 = "#475569"
 _INK3 = "#94a3b8"
@@ -42,9 +42,9 @@ _CARD_BG = "#ffffff"
 _GOOD = "#10b981"
 _GOOD_BG = "rgba(16,185,129,0.08)"
 _GOOD_BORDER = "rgba(16,185,129,0.25)"
-_DANGER = "#ef4444"
-_DANGER_BG = "rgba(239,68,68,0.08)"
-_DANGER_BORDER = "rgba(239,68,68,0.25)"
+_DANGER = "#c0392b"
+_DANGER_BG = "rgba(192,57,43,0.08)"
+_DANGER_BORDER = "rgba(192,57,43,0.25)"
 _WARNING = "#f59e0b"
 _WARNING_BG = "rgba(245,158,11,0.08)"
 _WARNING_BORDER = "rgba(245,158,11,0.25)"
@@ -1212,8 +1212,7 @@ class CadastroEmpresaView(QWidget):
         self.inline_msg.setProperty("ok", False)
 
     def apply_styles(self):
-        self.setStyleSheet(
-            f"""
+        base_qss = f"""
             /* ========================================
                MODERN SAAS DESIGN SYSTEM
                ======================================== */
@@ -1228,7 +1227,7 @@ class CadastroEmpresaView(QWidget):
                 background: qlineargradient(
                     x1:0, y1:0, x2:1, y2:0,
                     stop:0 {_WHITE},
-                    stop:1 rgba(99,102,241,0.02)
+                    stop:1 rgba(26,107,124,0.02)
                 );
                 border-radius: 16px;
                 padding: 4px 0px;
@@ -1275,7 +1274,7 @@ class CadastroEmpresaView(QWidget):
             }}
 
             QProgressBar#formProgress {{
-                background: rgba(99,102,241,0.12);
+                background: rgba(26,107,124,0.12);
                 border: none;
                 border-radius: 4px;
             }}
@@ -1435,7 +1434,7 @@ class CadastroEmpresaView(QWidget):
             }}
             
             QComboBox#saasCombo QAbstractItemView::item:hover {{
-                background: rgba(99,102,241,0.06);
+                background: rgba(26,107,124,0.06);
             }}
             
             /* SpinBox styling */
@@ -1470,7 +1469,7 @@ class CadastroEmpresaView(QWidget):
             }}
             
             QSpinBox#saasSpin::up-button:hover, QSpinBox#saasSpin::down-button:hover {{
-                background: rgba(99,102,241,0.08);
+                background: rgba(26,107,124,0.08);
             }}
             
             QSpinBox#saasSpin::up-arrow {{
@@ -1509,12 +1508,12 @@ class CadastroEmpresaView(QWidget):
                 background: qlineargradient(
                     x1:0, y1:0, x2:0, y2:1,
                     stop:0 {_ACCENT_HOVER},
-                    stop:1 #4338ca
+                    stop:1 #104f5c
                 );
             }}
             
             QPushButton#btnPrimary:pressed {{
-                background: #4338ca;
+                background: #104f5c;
                 transform: translateY(1px);
             }}
             
@@ -1606,5 +1605,6 @@ class CadastroEmpresaView(QWidget):
                 color: {_GOOD};
             }}
             """
-        )
+        self._base_qss = base_qss
+        self.setStyleSheet(base_qss)
 

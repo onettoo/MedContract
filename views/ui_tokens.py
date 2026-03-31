@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 @dataclass(frozen=True)
@@ -40,21 +41,34 @@ class ClinicPalette:
     warning: str = "#d97706"        # Caution/attention
     danger: str = "#dc2626"         # Critical/urgent
 
-    # Light mode neutrals
+    # Light mode neutrals (modo unico)
     light_bg: str = "#ffffff"
     light_surface: str = "#f8fafc"
     light_text_primary: str = "#0f172a"
     light_text_secondary: str = "#64748b"
     light_border: str = "#e2e8f0"
 
-    # Dark mode neutrals
-    dark_bg: str = "#0f172a"
-    dark_surface: str = "#1e293b"
-    dark_text_primary: str = "#f1f5f9"
-    dark_text_secondary: str = "#cbd5e1"
-    dark_border: str = "#334155"
-
 
 # Create singleton instance
 CLINIC_PALETTE = ClinicPalette()
 
+
+@lru_cache(maxsize=1)
+def get_sans_family() -> str:
+    """
+    Carrega DM Sans de assets/fonts/ e retorna o nome da família.
+    Resultado cacheado — I/O de disco ocorre apenas uma vez por sessão.
+    """
+    from pathlib import Path
+    from PySide6.QtGui import QFontDatabase
+
+    fonts_dir = Path(__file__).resolve().parent.parent / "assets" / "fonts"
+    family = "Segoe UI"
+    if fonts_dir.exists():
+        for ttf in sorted(fonts_dir.glob("*.ttf")):
+            fid = QFontDatabase.addApplicationFont(str(ttf))
+            if fid >= 0:
+                fams = QFontDatabase.applicationFontFamilies(fid)
+                if fams and "DM Sans" in fams[0]:
+                    family = fams[0]
+    return family

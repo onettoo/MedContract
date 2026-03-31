@@ -298,7 +298,6 @@ class CadastroClienteView(QWidget):
         self.plano = None
         self.vencimento_dia = None
         self.forma_pagamento = None
-        self.pagamento_status = None
         self.valor_mensal = None
         self.resumo_contrato = None
         self.valor_card = None
@@ -444,7 +443,7 @@ class CadastroClienteView(QWidget):
 
             self.matricula["input"].setText(str(cliente.get("id", "") or ""))
             self.matricula["input"].setEnabled(False)
-            self.nome["input"].setText(cliente.get("nome", "") or "")
+            self.nome["input"].setText((cliente.get("nome", "") or "").upper())
             self.cpf["input"].setText(cliente.get("cpf", "") or "")
             self.telefone["input"].setText(cliente.get("telefone", "") or "")
             self.email["input"].setText(cliente.get("email", "") or "")
@@ -500,12 +499,6 @@ class CadastroClienteView(QWidget):
             if fp not in self.FORMAS_PAG:
                 fp = "Boleto"
             self.forma_pagamento["combo"].setCurrentText(fp)
-
-            if self.pagamento_status and "combo" in self.pagamento_status:
-                pag_st = cliente.get("pagamento_status") or "em_dia"
-                self.pagamento_status["combo"].setCurrentText(
-                    "Atrasado" if pag_st == "atrasado" else "Em dia"
-                )
 
             self.cpf["input"].setEnabled(False)
             self._last_saved_cliente_id = None
@@ -757,13 +750,6 @@ class CadastroClienteView(QWidget):
         row4.addLayout(self.forma_pagamento["layout"])
         c2.addLayout(row4)
 
-        row4b = QHBoxLayout()
-        row4b.setSpacing(10)
-        self.pagamento_status = self._labeled_combo_values("Status inicial do pagamento", ["Em dia", "Atrasado"])
-        row4b.addLayout(self.pagamento_status["layout"])
-        row4b.addStretch()
-        c2.addLayout(row4b)
-
         row5 = QHBoxLayout()
         row5.setSpacing(10)
         self.vencimento_dia = self._labeled_combo_values("Dia de vencimento", ["5", "10", "15", "20"])
@@ -923,7 +909,7 @@ class CadastroClienteView(QWidget):
             ("sidebar_plan",    "Plano: —"),
             ("sidebar_due",     "Vencimento: —"),
             ("sidebar_pay",     "Pagamento: —"),
-            ("sidebar_status",  "Status inicial: —"),
+            ("sidebar_status",  "Status: cálculo automático"),
             ("sidebar_deps",    "Dependentes: 0"),
             ("sidebar_address", "Endereço: —"),
         ]:
@@ -938,7 +924,7 @@ class CadastroClienteView(QWidget):
         root.addLayout(content_row, 1)
 
         # ── wiring combos ────────────────────────────────────────────────────
-        for combo_dict in (self.plano, self.vencimento_dia, self.forma_pagamento, self.pagamento_status):
+        for combo_dict in (self.plano, self.vencimento_dia, self.forma_pagamento):
             combo_dict["combo"].currentTextChanged.connect(self._recalc_valor_and_resumo)
             combo_dict["combo"].currentIndexChanged.connect(self._mark_dirty)
             combo_dict["combo"].currentIndexChanged.connect(self._refresh_form_progress)
@@ -1029,16 +1015,8 @@ class CadastroClienteView(QWidget):
         return bool(self._dirty)
 
     def _on_voltar_clicked(self):
-        if not self.has_unsaved_changes():
-            self.voltar_signal.emit()
-            return
-        resp = QMessageBox.question(
-            self, "Alterações não salvas",
-            "Você tem alterações não salvas. Deseja descartar e voltar?",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if resp == QMessageBox.Yes:
-            self.voltar_signal.emit()
+        # UX direto: voltar sem confirmação de rascunho, conforme fluxo solicitado.
+        self.voltar_signal.emit()
 
     def _on_limpar_clicked(self):
         self.set_create_mode()
@@ -1170,7 +1148,6 @@ class CadastroClienteView(QWidget):
         return (
             bool((self.plano["combo"].currentText()           or "").strip()) and
             bool((self.forma_pagamento["combo"].currentText() or "").strip()) and
-            bool((self.pagamento_status["combo"].currentText()or "").strip()) and
             bool((self.vencimento_dia["combo"].currentText()  or "").strip())
         )
 
@@ -1557,6 +1534,7 @@ class CadastroClienteView(QWidget):
             w.returnPressed.connect(lambda i=i: self._focus_next(ordem, i))
 
         self.matricula["input"].editingFinished.connect(lambda: self._validate_matricula_field(show_message=False, check_duplicate=True))
+        self.nome["input"].textEdited.connect(self._force_nome_uppercase)
         self.nome["input"].editingFinished.connect(lambda: self._validate_text_required(self.nome, "Nome é obrigatório.", show_message=False))
         self.cpf["input"].editingFinished.connect(lambda: self._validate_cpf_field(show_message=False, check_duplicate=True))
         self.data_nascimento["input"].editingFinished.connect(lambda: self._validate_data_field(show_message=False))
@@ -1568,6 +1546,24 @@ class CadastroClienteView(QWidget):
         self.cidade["input"].editingFinished.connect(lambda: self._validate_text_required(self.cidade, "Cidade obrigatória.", show_message=False))
         self.uf["input"].editingFinished.connect(lambda: self._validate_uf_field(show_message=False))
         self.numero["input"].editingFinished.connect(lambda: self._validate_numero_field(show_message=False))
+
+    def _force_nome_uppercase(self, text: str):
+        if not self.nome or "input" not in self.nome:
+            return
+        field = self.nome["input"]
+        original = str(text or "")
+        upper = original.upper()
+        if original == upper:
+            return
+        pos = int(field.cursorPosition() or 0)
+        field.blockSignals(True)
+        try:
+            field.setText(upper)
+            field.setCursorPosition(min(pos, len(upper)))
+        finally:
+            field.blockSignals(False)
+        self._mark_dirty()
+        self._refresh_form_progress()
 
     def _focus_next(self, ordem, idx):
         if idx + 1 < len(ordem):
@@ -1863,13 +1859,12 @@ class CadastroClienteView(QWidget):
         except Exception:
             vdia = 10
         fp        = self.forma_pagamento["combo"].currentText() if self.forma_pagamento else "—"
-        pag_label = self.pagamento_status["combo"].currentText() if self.pagamento_status else "Em dia"
         extra     = f"{deps} dependente(s)" if deps > 0 else "sem dependentes"
 
         if self.resumo_contrato:
             extra_valor = "  ·  valor manual" if valor_manual else ""
             self.resumo_contrato.setText(
-                f"Plano {plano}  ·  vencimento dia {vdia:02d}  ·  {fp}  ·  {pag_label.lower()}  ·  {extra}{extra_valor}"
+                f"Plano {plano}  ·  vencimento dia {vdia:02d}  ·  {fp}  ·  {extra}{extra_valor}"
             )
         if self.dep_pricing_hint:
             self.dep_pricing_hint.setText(
@@ -1882,7 +1877,7 @@ class CadastroClienteView(QWidget):
         if self.sidebar_plan:    self.sidebar_plan.setText(f"Plano: {plano}")
         if self.sidebar_due:     self.sidebar_due.setText(f"Vencimento: dia {vdia:02d}")
         if self.sidebar_pay:     self.sidebar_pay.setText(f"Pagamento: {fp}")
-        if self.sidebar_status:  self.sidebar_status.setText(f"Status inicial: {pag_label}")
+        if self.sidebar_status:  self.sidebar_status.setText("Status: cálculo automático pelo mês vigente")
         if self.sidebar_deps:    self.sidebar_deps.setText(f"Dependentes: {deps}")
         if self.sidebar_address:
             parts = [p for p in self._address_parts() if p]
@@ -1903,8 +1898,7 @@ class CadastroClienteView(QWidget):
             self._valor_mensal_manual = None
             self._deps = []
             self._render_dependentes()
-            for attr, val in [("plano", "Classic"), ("forma_pagamento", "Boleto"),
-                              ("pagamento_status", "Em dia"), ("vencimento_dia", "10")]:
+            for attr, val in [("plano", "Classic"), ("forma_pagamento", "Boleto"), ("vencimento_dia", "10")]:
                 combo_dict = getattr(self, attr, None)
                 if combo_dict:
                     combo_dict["combo"].setCurrentText(val)
@@ -1947,7 +1941,6 @@ class CadastroClienteView(QWidget):
             "uf": (self.uf["input"].text() or "").strip(),
             "plano": (self.plano["combo"].currentText() or "").strip(),
             "forma_pagamento": (self.forma_pagamento["combo"].currentText() or "").strip(),
-            "pagamento_status": (self.pagamento_status["combo"].currentText() or "").strip(),
             "vencimento_dia": (self.vencimento_dia["combo"].currentText() or "").strip(),
             "valor_mensal_manual": self._valor_mensal_manual,
             "dependentes": list(self._deps),
@@ -1957,7 +1950,7 @@ class CadastroClienteView(QWidget):
         self._suspend_dirty = True
         try:
             self.matricula["input"].setText(str(data.get("matricula", "") or ""))
-            self.nome["input"].setText(data.get("nome", "") or "")
+            self.nome["input"].setText((data.get("nome", "") or "").upper())
             self.cpf["input"].setText(data.get("cpf", "") or "")
             self.data_nascimento["input"].setText(data.get("data_nascimento", "") or "")
             self.telefone["input"].setText(data.get("telefone", "") or "")
@@ -1968,8 +1961,7 @@ class CadastroClienteView(QWidget):
             self.cidade["input"].setText(data.get("cidade", "") or "")
             self.numero["input"].setText(data.get("numero", "") or "")
             self.uf["input"].setText((data.get("uf", "") or "").upper())
-            for attr, key in [("plano","plano"),("forma_pagamento","forma_pagamento"),
-                              ("pagamento_status","pagamento_status"),("vencimento_dia","vencimento_dia")]:
+            for attr, key in [("plano","plano"),("forma_pagamento","forma_pagamento"),("vencimento_dia","vencimento_dia")]:
                 v = (data.get(key, "") or "").strip()
                 getattr(self, attr)["combo"].setCurrentText(v)
             vm_manual = data.get("valor_mensal_manual", None)
@@ -2076,7 +2068,8 @@ class CadastroClienteView(QWidget):
 
         matricula_txt = (self.matricula["input"].text() or "").strip()
         matricula     = int(matricula_txt) if self._modo == "create" else int(self._edit_id)
-        nome          = (self.nome["input"].text() or "").strip()
+        nome          = (self.nome["input"].text() or "").strip().upper()
+        self.nome["input"].setText(nome)
         cpf           = (self.cpf["input"].text() or "").strip()
         data_nasc     = (self.data_nascimento["input"].text() or "").strip()
         dt_nasc       = datetime.strptime(data_nasc, "%d/%m/%Y")
@@ -2094,8 +2087,7 @@ class CadastroClienteView(QWidget):
         except Exception:
             venc_dia = 10
         valor_mensal  = self._calc_valor()
-        pag_label     = self.pagamento_status["combo"].currentText()
-        pag_value     = "atrasado" if pag_label == "Atrasado" else "em_dia"
+        pag_value     = "em_dia"
 
         deps_payload = []
         for d in self._deps:
@@ -2145,23 +2137,102 @@ class CadastroClienteView(QWidget):
         vencimento = int(dados.get("vencimento_dia") or 0)
         valor = float(dados.get("valor_mensal") or 0.0)
         resumo = (
-            "Etapa final de revisão do novo contrato:\n\n"
+            "Confira os dados antes de salvar:\n\n"
             f"• Cliente: {nome}\n"
             f"• CPF: {cpf}\n"
             f"• Plano: {plano}\n"
             f"• Forma de pagamento: {forma}\n"
             f"• Vencimento: dia {vencimento}\n"
             f"• Dependentes: {dependentes}\n"
-            f"• Valor mensal: {self._br_money(valor)}\n\n"
-            "Confirmar salvamento?"
+            f"• Valor mensal: {self._br_money(valor)}"
         )
-        return QMessageBox.question(
-            self,
-            "Revisar novo contrato",
-            resumo,
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        ) == QMessageBox.Yes
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Revisar novo contrato")
+        dlg.setModal(True)
+        dlg.setObjectName("ReviewContratoDialog")
+        dlg.setMinimumWidth(560)
+
+        lay = QVBoxLayout(dlg)
+        lay.setContentsMargins(20, 18, 20, 16)
+        lay.setSpacing(10)
+
+        title = QLabel("Revisar novo contrato")
+        title.setObjectName("dlgTitle")
+        sub = QLabel("Etapa final antes do salvamento")
+        sub.setObjectName("dlgSub")
+        body = QLabel(resumo)
+        body.setObjectName("dlgBody")
+        body.setWordWrap(True)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        btn_back = QPushButton("Voltar e revisar")
+        btn_back.setObjectName("dlgBtnSecondary")
+        btn_back.setFixedHeight(36)
+        btn_ok = QPushButton("Confirmar e salvar")
+        btn_ok.setObjectName("dlgBtnPrimary")
+        btn_ok.setFixedHeight(36)
+        actions.addWidget(btn_back)
+        actions.addWidget(btn_ok)
+
+        lay.addWidget(title)
+        lay.addWidget(sub)
+        lay.addWidget(body)
+        lay.addLayout(actions)
+
+        dlg.setStyleSheet(f"""
+            QDialog#ReviewContratoDialog {{
+                background: {_WHITE};
+                border: 1px solid rgba(15, 23, 42, 0.12);
+                border-radius: 14px;
+                font-family: '{self._sans}', 'Segoe UI', sans-serif;
+            }}
+            QLabel#dlgTitle {{
+                font-size: 18px;
+                font-weight: 800;
+                color: {_INK};
+            }}
+            QLabel#dlgSub {{
+                font-size: 12px;
+                font-weight: 600;
+                color: {_INK2};
+            }}
+            QLabel#dlgBody {{
+                background: {_BG};
+                border: 1px solid {_LINE};
+                border-radius: 10px;
+                padding: 12px 14px;
+                color: {_INK};
+                font-size: 12px;
+                line-height: 1.35;
+            }}
+            QPushButton#dlgBtnPrimary {{
+                background: {_ACCENT};
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 0 16px;
+                font-weight: 700;
+                min-width: 160px;
+            }}
+            QPushButton#dlgBtnPrimary:hover {{ background: {_ACCENT_HOVER}; }}
+            QPushButton#dlgBtnSecondary {{
+                background: {_WHITE};
+                color: {_INK};
+                border: 1px solid {_LINE};
+                border-radius: 8px;
+                padding: 0 14px;
+                font-weight: 700;
+            }}
+            QPushButton#dlgBtnSecondary:hover {{
+                border-color: {_ACCENT};
+                color: {_ACCENT};
+            }}
+        """)
+
+        btn_ok.clicked.connect(dlg.accept)
+        btn_back.clicked.connect(dlg.reject)
+        return dlg.exec() == QDialog.Accepted
 
     def _on_baixar_contrato_clicked(self):
         if not self._last_saved_cliente_id:
@@ -2256,8 +2327,6 @@ class CadastroClienteView(QWidget):
             target = self.vencimento_dia
         elif "forma de pagamento" in norm:
             target = self.forma_pagamento
-        elif "status de pagamento" in norm:
-            target = self.pagamento_status
         elif "valor mensal" in norm:
             target = self.valor_mensal
         elif "plano" in norm:
@@ -2355,7 +2424,7 @@ class CadastroClienteView(QWidget):
         for attr in ("matricula","nome","cpf","data_nascimento","telefone","email",
                      "cep","logradouro","bairro","cidade","numero","uf",
                      "dep_nome","dep_cpf","dep_data_nascimento","plano",
-                     "forma_pagamento","pagamento_status","vencimento_dia"):
+                     "forma_pagamento","vencimento_dia"):
             self._set_field_error(getattr(self, attr, None), "")
 
     # =========================
@@ -2363,7 +2432,7 @@ class CadastroClienteView(QWidget):
     # =========================
     def apply_styles(self):
         f = self._sans
-        self.setStyleSheet(f"""
+        base_qss = f"""
         /* ── raiz ────────────────────────────────────────────────────────── */
         QWidget#CadastroCliente {{
             background: {_BG};
@@ -2797,4 +2866,7 @@ class CadastroClienteView(QWidget):
         QScrollBar::handle:vertical:hover {{ background: {_ACCENT}; }}
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
-        """)
+        """
+        self._base_qss = base_qss
+        self.setStyleSheet(base_qss)
+

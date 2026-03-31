@@ -149,17 +149,9 @@ def _norm_text(text: str) -> str:
 
 
 def _load_fonts() -> str:
-    """Carrega DM Sans e retorna o nome da família."""
-    fonts_dir = Path(__file__).resolve().parent / "assets" / "fonts"
-    family = "Segoe UI"
-    if fonts_dir.exists():
-        for ttf in fonts_dir.glob("*.ttf"):
-            fid = QFontDatabase.addApplicationFont(str(ttf))
-            if fid >= 0:
-                fams = QFontDatabase.applicationFontFamilies(fid)
-                if fams and "DM Sans" in fams[0]:
-                    family = fams[0]
-    return family
+    """Delega ao cache centralizado em ui_tokens para evitar I/O duplicado."""
+    from views.ui_tokens import get_sans_family
+    return get_sans_family()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1097,9 +1089,15 @@ class InsightsTabWorker(QRunnable):
     def run(self):
         try:
             result = self.fn()
-            self.signals.finished.emit(self.key, dict(result or {}))
+            try:
+                self.signals.finished.emit(self.key, dict(result or {}))
+            except RuntimeError:
+                return
         except Exception as exc:
-            self.signals.error.emit(self.key, str(exc))
+            try:
+                self.signals.error.emit(self.key, str(exc))
+            except RuntimeError:
+                return
 
 
 class FinanceInsightsModal(QDialog):
@@ -1122,6 +1120,7 @@ class FinanceInsightsModal(QDialog):
         self._tab_loaded: dict[str, bool] = {}
         self._tab_loading: dict[str, bool] = {}
         self._tab_data: dict[str, dict] = {}
+        self._loading_anim: dict[str, dict] = {}
         self._expense_limit = 5000.0
         self._fade_anim = None
         self._slide_anim = None
@@ -1211,7 +1210,11 @@ class FinanceInsightsModal(QDialog):
             self._tab_layouts[key] = body_lay
             self._tab_loaded[key] = False
             self._tab_loading[key] = False
-            self._set_tab_loading(key, "Aguarde, carregando dados...")
+            idle = QLabel("Abra a aba para carregar os insights desta seção.")
+            idle.setObjectName("insightMuted")
+            idle.setWordWrap(True)
+            body_lay.addWidget(idle)
+            body_lay.addStretch(1)
 
         footer = QHBoxLayout()
         footer.setSpacing(8)
@@ -1225,6 +1228,7 @@ class FinanceInsightsModal(QDialog):
         self.btn_pdf.clicked.connect(self._export_pdf_report)
         footer.addWidget(self.btn_pdf)
         card_layout.addLayout(footer)
+        self._refresh_footer_loading_state()
 
     def _apply_styles(self):
         self.setStyleSheet(f"""
@@ -1258,7 +1262,7 @@ class FinanceInsightsModal(QDialog):
         QTabWidget#insightsTabs::pane {{
             border: 1px solid {_LINE};
             border-radius: 10px;
-            background: {_BG};
+            background: #f8fbfd;
             top: -1px;
         }}
         QTabWidget#insightsTabs::tab-bar {{
@@ -1286,7 +1290,8 @@ class FinanceInsightsModal(QDialog):
             background: transparent;
         }}
         QWidget#insightsBody {{
-            background: transparent;
+            background: #f8fbfd;
+            border-radius: 10px;
         }}
         QLabel#insightsFooterHint {{
             color: {_INK3};
@@ -1303,6 +1308,202 @@ class FinanceInsightsModal(QDialog):
         }}
         QPushButton#insightsPrimaryBtn:hover {{
             background: {_ACCENT_HOVER};
+        }}
+        QFrame#insightStatCard {{
+            background: {_WHITE};
+            border: 1px solid {_LINE};
+            border-radius: 10px;
+        }}
+        QFrame#insightStatCard[tone="success"] {{
+            border-color: rgba(26,122,71,0.35);
+            background: rgba(26,122,71,0.05);
+        }}
+        QFrame#insightStatCard[tone="danger"] {{
+            border-color: rgba(192,57,43,0.35);
+            background: rgba(192,57,43,0.05);
+        }}
+        QLabel#insightCardTitle {{
+            color: {_INK2};
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+        }}
+        QLabel#insightCardValue {{
+            color: {_INK};
+            font-size: 22px;
+            font-weight: 800;
+        }}
+        QLabel#insightCardSub {{
+            color: {_INK3};
+            font-size: 11px;
+        }}
+        QLabel#insightBlockTitle {{
+            color: {_INK};
+            font-size: 13px;
+            font-weight: 700;
+        }}
+        QLabel#insightMuted {{
+            color: {_INK3};
+            font-size: 11px;
+        }}
+        QLabel#insightAlertGood {{
+            background: rgba(26,122,71,0.10);
+            color: {_GOOD};
+            border: 1px solid rgba(26,122,71,0.22);
+            border-radius: 8px;
+            padding: 8px 10px;
+            font-size: 12px;
+            font-weight: 600;
+        }}
+        QLabel#insightAlertDanger {{
+            background: rgba(192,57,43,0.10);
+            color: {_DANGER};
+            border: 1px solid rgba(192,57,43,0.22);
+            border-radius: 8px;
+            padding: 8px 10px;
+            font-size: 12px;
+            font-weight: 600;
+        }}
+        QTableWidget#insightTable {{
+            border: 1px solid {_LINE};
+            border-radius: 8px;
+            background: {_WHITE};
+            gridline-color: transparent;
+            selection-background-color: rgba(26,107,124,0.10);
+            selection-color: {_INK};
+            font-size: 12px;
+        }}
+        QTableWidget#insightTable::item {{
+            padding: 5px 8px;
+            border-bottom: 1px solid rgba(232,234,237,0.55);
+        }}
+        QPushButton#insightWaBtn {{
+            background: #25d366;
+            color: {_WHITE};
+            border: none;
+            border-radius: 7px;
+            padding: 2px 10px;
+            font-size: 11px;
+            font-weight: 700;
+        }}
+        QPushButton#insightWaBtn:hover {{
+            background: #1fab57;
+        }}
+        QPushButton#insightWaBtn:disabled {{
+            background: #b9d8c2;
+            color: #f4fff8;
+        }}
+        QDoubleSpinBox#insightLimitSpin {{
+            background: {_WHITE};
+            border: 1px solid {_LINE};
+            border-radius: 7px;
+            padding-left: 8px;
+            min-height: 30px;
+            color: {_INK};
+            font-size: 12px;
+            font-weight: 600;
+        }}
+        QFrame#insightLoadingCard {{
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 rgba(26,107,124,0.10),
+                stop:1 rgba(26,107,124,0.04)
+            );
+            border: 1px solid rgba(26,107,124,0.18);
+            border-radius: 12px;
+        }}
+        QLabel#insightLoadingTitle {{
+            color: {_INK};
+            font-size: 12px;
+            font-weight: 700;
+        }}
+        QLabel#insightLoadingStep {{
+            color: {_INK2};
+            font-size: 11px;
+            font-weight: 600;
+        }}
+        QLabel#insightLoadingValue {{
+            color: {_ACCENT};
+            font-size: 11px;
+            font-weight: 800;
+        }}
+        QProgressBar#insightProgressBar {{
+            background: rgba(15,23,42,0.08);
+            border: 1px solid rgba(15,23,42,0.08);
+            border-radius: 6px;
+            height: 10px;
+            padding: 1px;
+        }}
+        QProgressBar#insightProgressBar::chunk {{
+            border-radius: 5px;
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:0,
+                stop:0 #1a6b7c,
+                stop:0.55 #2b9ab0,
+                stop:1 #3bbcc9
+            );
+        }}
+        QFrame#insightSaldoHero {{
+            border-radius: 13px;
+            border: 1px solid rgba(26,107,124,0.20);
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:1,
+                stop:0 rgba(26,107,124,0.15),
+                stop:0.58 rgba(43,154,176,0.10),
+                stop:1 rgba(43,154,176,0.05)
+            );
+        }}
+        QFrame#insightSaldoHero[tone="danger"] {{
+            border: 1px solid rgba(192,57,43,0.26);
+            background: qlineargradient(
+                x1:0, y1:0, x2:1, y2:1,
+                stop:0 rgba(192,57,43,0.13),
+                stop:0.58 rgba(211,84,0,0.09),
+                stop:1 rgba(211,84,0,0.05)
+            );
+        }}
+        QLabel#insightSaldoIcon {{
+            font-size: 21px;
+            font-weight: 700;
+            color: {_ACCENT};
+        }}
+        QLabel#insightSaldoTitle {{
+            color: {_INK2};
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+        }}
+        QLabel#insightSaldoValue {{
+            color: {_INK};
+            font-size: 24px;
+            font-weight: 800;
+        }}
+        QLabel#insightSaldoSub {{
+            color: {_INK3};
+            font-size: 11px;
+            font-weight: 600;
+        }}
+        QLabel#insightSaldoDelta {{
+            border-radius: 9px;
+            padding: 2px 8px;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 0.2px;
+        }}
+        QLabel#insightSaldoDelta[trend="up"] {{
+            background: rgba(26,122,71,0.14);
+            color: #145e38;
+            border: 1px solid rgba(26,122,71,0.25);
+        }}
+        QLabel#insightSaldoDelta[trend="down"] {{
+            background: rgba(192,57,43,0.14);
+            color: {_DANGER};
+            border: 1px solid rgba(192,57,43,0.28);
+        }}
+        QLabel#insightSaldoDelta[trend="flat"] {{
+            background: rgba(15,23,42,0.10);
+            color: {_INK2};
+            border: 1px solid rgba(15,23,42,0.14);
         }}
         """)
 
@@ -1372,25 +1573,127 @@ class FinanceInsightsModal(QDialog):
             child = item.widget()
             sub = item.layout()
             if child is not None:
+                child.setParent(None)
                 child.deleteLater()
             elif sub is not None:
                 self._clear_layout(sub)
 
-    def _set_tab_loading(self, key: str, text: str):
+    def _loading_step_text(self, key: str) -> str:
+        steps = {
+            "resumo": "Consolidando saldos e métricas do mês...",
+            "inadimplencia": "Calculando devedores e histórico de inadimplência...",
+            "receita": "Analisando evolução da receita e comparativos...",
+            "despesas": "Classificando despesas por categoria e alertas...",
+            "fluxo": "Projetando fluxo de caixa dos próximos 30 dias...",
+            "kpi": "Processando indicadores de performance (KPI)...",
+        }
+        return steps.get(str(key or ""), "Processando dados financeiros...")
+
+    def _stop_loading_animation(self, key: str):
+        state = self._loading_anim.pop(str(key or ""), None)
+        if not isinstance(state, dict):
+            return
+        timer = state.get("timer")
+        if isinstance(timer, QTimer):
+            try:
+                timer.stop()
+                timer.deleteLater()
+            except Exception:
+                pass
+
+    def _start_loading_animation(self, key: str, bar: QProgressBar, value_label: QLabel):
+        self._stop_loading_animation(key)
+        state = {"value": 14, "direction": 1, "bar": bar, "label": value_label}
+        bar.setValue(int(state["value"]))
+        value_label.setText(f"{int(state['value'])}%")
+
+        timer = QTimer(self)
+        timer.setInterval(65)
+
+        def _tick():
+            current = int(state.get("value", 14) or 14)
+            direction = int(state.get("direction", 1) or 1)
+            current += 2 if direction > 0 else -1
+            if current >= 92:
+                current = 92
+                direction = -1
+            elif current <= 28:
+                current = 28
+                direction = 1
+            state["value"] = current
+            state["direction"] = direction
+            try:
+                bar.setValue(current)
+                value_label.setText(f"{current}%")
+            except Exception:
+                self._stop_loading_animation(key)
+
+        timer.timeout.connect(_tick)
+        timer.start()
+        state["timer"] = timer
+        self._loading_anim[str(key or "")] = state
+
+    def _refresh_footer_loading_state(self):
+        if not hasattr(self, "footer_hint"):
+            return
+        total = len(self.TAB_ORDER)
+        loading = 0
+        loaded = 0
+        for key, _label in self.TAB_ORDER:
+            if self._tab_loading.get(key):
+                loading += 1
+            if self._tab_loaded.get(key):
+                loaded += 1
+        if loading > 0:
+            self.footer_hint.setText(f"Carregando insights... {loaded}/{total} abas prontas")
+        elif loaded >= total and total > 0:
+            self.footer_hint.setText("Dados sincronizados e prontos para análise.")
+        else:
+            self.footer_hint.setText("Selecione uma aba para carregar os dados dinamicamente.")
+
+    def _set_tab_loading(self, key: str, text: str, *, animate: bool = False):
         lay = self._tab_layouts.get(key)
         if lay is None:
             return
+        self._stop_loading_animation(key)
         self._clear_layout(lay)
+
+        card = QFrame()
+        card.setObjectName("insightLoadingCard")
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        card.setMaximumHeight(94)
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(12, 10, 12, 10)
+        cl.setSpacing(6)
+
         msg = QLabel(str(text or "Carregando..."))
-        msg.setObjectName("insightMuted")
+        msg.setObjectName("insightLoadingTitle")
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        step = QLabel(self._loading_step_text(key))
+        step.setObjectName("insightLoadingStep")
+        value_lbl = QLabel("14%")
+        value_lbl.setObjectName("insightLoadingValue")
+        row.addWidget(step, 1)
+        row.addWidget(value_lbl, 0, Qt.AlignRight)
+
         bar = QProgressBar()
-        bar.setRange(0, 0)
+        bar.setObjectName("insightProgressBar")
+        bar.setRange(0, 100)
+        bar.setValue(14)
         bar.setTextVisible(False)
-        bar.setFixedHeight(8)
-        lay.addSpacing(12)
-        lay.addWidget(msg)
-        lay.addWidget(bar)
+        bar.setFixedHeight(12)
+
+        cl.addWidget(msg)
+        cl.addLayout(row)
+        cl.addWidget(bar)
+
+        lay.addWidget(card)
         lay.addStretch(1)
+        if animate:
+            self._start_loading_animation(key, bar, value_lbl)
+        self._refresh_footer_loading_state()
 
     def _make_stat_card(self, title: str, value: str, sub: str = "", tone: str = "") -> QFrame:
         card = QFrame()
@@ -1411,6 +1714,74 @@ class FinanceInsightsModal(QDialog):
         cl.addWidget(t)
         cl.addWidget(v)
         cl.addWidget(s)
+        return card
+
+    def _make_saldo_hero_card(self, data: dict) -> QFrame:
+        saldo = float(data.get("saldo", 0.0) or 0.0)
+        saldo_prev = float(data.get("saldo_mes_anterior", 0.0) or 0.0)
+        delta = float(data.get("delta_saldo", 0.0) or 0.0)
+        pct = float(data.get("delta_saldo_pct", 0.0) or 0.0)
+        has_base = bool(data.get("delta_has_base", False))
+        superavit = bool(data.get("superavit", False))
+
+        trend = "flat"
+        if delta > 0.009:
+            trend = "up"
+        elif delta < -0.009:
+            trend = "down"
+
+        trend_icon = "↗" if trend == "up" else ("↘" if trend == "down" else "•")
+        delta_abs = br_money(abs(delta))
+        delta_money = f"+{delta_abs}" if delta > 0 else (f"-{delta_abs}" if delta < 0 else delta_abs)
+        if has_base:
+            delta_pct_txt = f"+{pct:.1f}%" if pct > 0 else (f"{pct:.1f}%" if pct < 0 else "0.0%")
+            delta_txt = f"{trend_icon} {delta_pct_txt} · {delta_money}"
+        else:
+            delta_txt = f"{trend_icon} {delta_money} vs mês anterior"
+
+        card = QFrame()
+        card.setObjectName("insightSaldoHero")
+        if not superavit:
+            card.setProperty("tone", "danger")
+        card.setMinimumHeight(116)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        root = QHBoxLayout(card)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(12)
+
+        icon_lbl = QLabel("💰" if superavit else "⚠️")
+        icon_lbl.setObjectName("insightSaldoIcon")
+        icon_lbl.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        icon_lbl.setFixedWidth(28)
+        root.addWidget(icon_lbl, 0, Qt.AlignTop)
+
+        col = QVBoxLayout()
+        col.setSpacing(3)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        ttl = QLabel("SALDO LÍQUIDO")
+        ttl.setObjectName("insightSaldoTitle")
+        delta_lbl = QLabel(delta_txt)
+        delta_lbl.setObjectName("insightSaldoDelta")
+        delta_lbl.setProperty("trend", trend)
+        delta_lbl.setAlignment(Qt.AlignCenter)
+        delta_lbl.setMinimumHeight(22)
+        top.addWidget(ttl)
+        top.addStretch(1)
+        top.addWidget(delta_lbl, 0, Qt.AlignRight)
+
+        value_lbl = QLabel(br_money(saldo))
+        value_lbl.setObjectName("insightSaldoValue")
+        sub = QLabel(f"Receitas recebidas − despesas pagas · mês anterior: {br_money(saldo_prev)}")
+        sub.setObjectName("insightSaldoSub")
+        sub.setWordWrap(True)
+
+        col.addLayout(top)
+        col.addWidget(value_lbl)
+        col.addWidget(sub)
+        root.addLayout(col, 1)
         return card
 
     def _month_axis_label(self, month_ref: str) -> str:
@@ -1435,14 +1806,16 @@ class FinanceInsightsModal(QDialog):
         if compute_fn is None:
             return
         self._tab_loading[key] = True
-        self._set_tab_loading(key, "Carregando dados desta aba...")
+        self._set_tab_loading(key, "Carregando dados desta aba...", animate=True)
         worker = InsightsTabWorker(key, compute_fn)
         worker.signals.finished.connect(self._on_tab_data_ready)
         worker.signals.error.connect(self._on_tab_data_error)
         self._pool.start(worker)
+        self._refresh_footer_loading_state()
 
     def _on_tab_data_ready(self, key: str, data: dict):
         k = str(key or "")
+        self._stop_loading_animation(k)
         self._tab_loading[k] = False
         self._tab_loaded[k] = True
         payload = dict(data or {})
@@ -1450,9 +1823,11 @@ class FinanceInsightsModal(QDialog):
         renderer = self._render_map.get(k)
         if renderer is not None:
             renderer(payload)
+        self._refresh_footer_loading_state()
 
     def _on_tab_data_error(self, key: str, message: str):
         k = str(key or "")
+        self._stop_loading_animation(k)
         self._tab_loading[k] = False
         lay = self._tab_layouts.get(k)
         if lay is None:
@@ -1462,6 +1837,12 @@ class FinanceInsightsModal(QDialog):
         lbl.setObjectName("insightAlertDanger")
         lay.addWidget(lbl)
         lay.addStretch(1)
+        self._refresh_footer_loading_state()
+
+    def closeEvent(self, event):
+        for key in list(self._loading_anim.keys()):
+            self._stop_loading_animation(key)
+        super().closeEvent(event)
 
     # ── cálculos de dados ───────────────────────────────────────────────────
     def _fetch_contract_snapshot(self) -> dict:
@@ -1474,6 +1855,10 @@ class FinanceInsightsModal(QDialog):
             "atrasados_total": 0,
             "valor_atrasado": 0.0,
         }
+        try:
+            db.sincronizar_status_pagamento_clientes()
+        except Exception:
+            pass
         conn = db.connect()
         try:
             cur = conn.cursor()
@@ -1642,20 +2027,36 @@ class FinanceInsightsModal(QDialog):
     def _compute_resumo_data(self) -> dict:
         ref = self._mes_ref
         snap = self._fetch_contract_snapshot()
-        receita_map = self._fetch_month_receita_totals([ref])
+        prev_ref = _month_shift(ref, -1)
+        receita_map = self._fetch_month_receita_totals([prev_ref, ref])
         receita = float(receita_map.get(ref, 0.0) or 0.0)
+        receita_prev = float(receita_map.get(prev_ref, 0.0) or 0.0)
 
         contas = db.carregar_contas_pagar_mes(ref, detail_limit=1) or {}
+        contas_prev = db.carregar_contas_pagar_mes(prev_ref, detail_limit=1) or {}
         despesas_pagas = float(contas.get("valor_pago_total", 0.0) or 0.0)
+        despesas_pagas_prev = float(contas_prev.get("valor_pago_total", 0.0) or 0.0)
         total_aberto = max(0.0, float(snap.get("mrr", 0.0) or 0.0) - receita)
         vencido = float(snap.get("valor_atrasado", 0.0) or 0.0)
         saldo = receita - despesas_pagas
+        saldo_prev = receita_prev - despesas_pagas_prev
+        delta_saldo = saldo - saldo_prev
+        has_base = abs(float(saldo_prev)) > 0.009
+        if has_base:
+            delta_pct = (delta_saldo / float(saldo_prev)) * 100.0
+        else:
+            delta_pct = 100.0 if delta_saldo > 0 else (-100.0 if delta_saldo < 0 else 0.0)
         return {
             "recebido": receita,
             "aberto": total_aberto,
             "vencido": vencido,
             "despesas_pagas": despesas_pagas,
             "saldo": saldo,
+            "saldo_mes_anterior": saldo_prev,
+            "delta_saldo": delta_saldo,
+            "delta_saldo_pct": delta_pct,
+            "delta_has_base": has_base,
+            "mes_anterior": prev_ref,
             "superavit": saldo >= 0.0,
         }
 
@@ -1925,6 +2326,485 @@ class FinanceInsightsModal(QDialog):
             "tempo_medio": tempo_medio,
         }
 
+    # ── render de abas ──────────────────────────────────────────────────────
+    def _render_resumo_tab(self, data: dict):
+        lay = self._tab_layouts.get("resumo")
+        if lay is None:
+            return
+        self._clear_layout(lay)
+
+        intro = QLabel("Visão consolidada das receitas, despesas e saldo do mês atual.")
+        intro.setObjectName("insightMuted")
+        lay.addWidget(intro)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+
+        def _build_card(title: str, value: str, sub: str, tone: str = "") -> QFrame:
+            card = self._make_stat_card(title, value, sub, tone=tone)
+            card.setMinimumHeight(96)
+            card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            return card
+
+        recebido_card = _build_card(
+            "Total recebido",
+            br_money(data.get("recebido", 0.0)),
+            "Pagamentos confirmados no mês",
+        )
+        aberto_card = _build_card(
+            "Total em aberto",
+            br_money(data.get("aberto", 0.0)),
+            "Valor previsto ainda não recebido",
+        )
+        vencido_card = _build_card(
+            "Total vencido",
+            br_money(data.get("vencido", 0.0)),
+            "Contratos em atraso",
+            "danger",
+        )
+        despesas_card = _build_card(
+            "Despesas pagas",
+            br_money(data.get("despesas_pagas", 0.0)),
+            "Contas quitadas no mês",
+        )
+        saldo_card = self._make_saldo_hero_card(data)
+
+        grid.addWidget(recebido_card, 0, 0)
+        grid.addWidget(aberto_card, 0, 1)
+        grid.addWidget(vencido_card, 1, 0)
+        grid.addWidget(despesas_card, 1, 1)
+        grid.addWidget(saldo_card, 2, 0, 1, 2)
+        lay.addLayout(grid)
+
+        flag = bool(data.get("superavit", False))
+        badge = QLabel("🟢 Superávit no mês" if flag else "🔴 Déficit no mês")
+        badge.setObjectName("insightAlertGood" if flag else "insightAlertDanger")
+        lay.addWidget(badge)
+        lay.addStretch(1)
+
+    def _open_whatsapp(self, raw_phone: str):
+        digits = _only_digits(raw_phone)
+        if not digits:
+            QMessageBox.warning(self, "WhatsApp", "Número de telefone não informado para este devedor.")
+            return
+        number = digits if digits.startswith("55") else f"55{digits}"
+        QDesktopServices.openUrl(QUrl(f"https://wa.me/{number}"))
+
+    def _render_inadimplencia_tab(self, data: dict):
+        lay = self._tab_layouts.get("inadimplencia")
+        if lay is None:
+            return
+        self._clear_layout(lay)
+
+        top = self._make_stat_card(
+            "Percentual de inadimplência",
+            f"{float(data.get('taxa', 0.0) or 0.0):.1f}%",
+            f"{int(data.get('atrasados', 0) or 0)} atrasados de {int(data.get('ativos', 0) or 0)} contratos ativos",
+            tone="danger" if float(data.get("taxa", 0.0) or 0.0) >= 10 else "",
+        )
+        lay.addWidget(top)
+
+        chart_title = QLabel("Inadimplência dos últimos 6 meses")
+        chart_title.setObjectName("insightBlockTitle")
+        lay.addWidget(chart_title)
+        chart = SimpleTrendChart(mode="bar")
+        chart.set_series(
+            list(data.get("hist_labels", []) or []),
+            list(data.get("hist_values", []) or []),
+            color=_DANGER,
+        )
+        lay.addWidget(chart)
+
+        tbl_title = QLabel("Top 5 devedores")
+        tbl_title.setObjectName("insightBlockTitle")
+        lay.addWidget(tbl_title)
+        table = QTableWidget(0, 4)
+        table.setObjectName("insightTable")
+        table.setHorizontalHeaderLabels(["Nome", "Valor em aberto", "Dias em atraso", "Ação"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        top5 = list(data.get("top5", []) or [])
+        table.setRowCount(len(top5))
+        for i, row in enumerate(top5):
+            nome = f"{str(row.get('nome', '—'))} ({str(row.get('tipo', ''))})"
+            table.setItem(i, 0, QTableWidgetItem(nome))
+            table.setItem(i, 1, QTableWidgetItem(br_money(float(row.get("valor", 0.0) or 0.0))))
+            dias_item = QTableWidgetItem(str(int(row.get("dias", 0) or 0)))
+            dias_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(i, 2, dias_item)
+            btn = QPushButton("Enviar cobrança")
+            btn.setObjectName("insightWaBtn")
+            phone = str(row.get("telefone", "") or "")
+            btn.setEnabled(bool(_only_digits(phone)))
+            btn.clicked.connect(lambda _=False, n=phone: self._open_whatsapp(n))
+            table.setCellWidget(i, 3, btn)
+        table.setMinimumHeight(200)
+        lay.addWidget(table)
+        lay.addStretch(1)
+
+    def _render_receita_tab(self, data: dict):
+        lay = self._tab_layouts.get("receita")
+        if lay is None:
+            return
+        self._clear_layout(lay)
+
+        title = QLabel("Evolução da receita mensal (últimos 12 meses)")
+        title.setObjectName("insightBlockTitle")
+        lay.addWidget(title)
+        chart = SimpleTrendChart(mode="line")
+        chart.set_series(
+            list(data.get("labels_12", []) or []),
+            list(data.get("values_12", []) or []),
+            color=_ACCENT,
+        )
+        lay.addWidget(chart)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        delta = float(data.get("delta", 0.0) or 0.0)
+        pct = float(data.get("pct", 0.0) or 0.0)
+        cards = [
+            ("Mês atual", br_money(data.get("atual", 0.0)), "Receita recebida no mês de referência", ""),
+            ("Mesmo mês ano anterior", br_money(data.get("ano_anterior", 0.0)), "Base para comparativo anual", ""),
+            ("Variação YoY", f"{pct:+.1f}% ({br_money(delta)})", "Mês atual vs mesmo mês do ano anterior", "success" if delta >= 0 else "danger"),
+            ("Média mensal (6m)", br_money(data.get("media_6", 0.0)), "Média dos últimos 6 meses", ""),
+            ("Projeção mês corrente", br_money(data.get("projecao", 0.0)), "Baseado em contratos ativos + pagamentos confirmados", ""),
+            ("A receber para projeção", br_money(data.get("restante", 0.0)), "Diferença até a projeção do mês", ""),
+        ]
+        for i, (t, v, s, tone) in enumerate(cards):
+            grid.addWidget(self._make_stat_card(t, v, s, tone=tone), i // 3, i % 3)
+        lay.addLayout(grid)
+        lay.addStretch(1)
+
+    def _on_expense_limit_changed(self, value: float):
+        self._expense_limit = float(value or 0.0)
+        if self._tab_loaded.get("despesas"):
+            self._render_despesas_tab(dict(self._tab_data.get("despesas", {}) or {}))
+
+    def _render_despesas_tab(self, data: dict):
+        lay = self._tab_layouts.get("despesas")
+        if lay is None:
+            return
+        self._clear_layout(lay)
+
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        ttl = QLabel("Distribuição de despesas por categoria")
+        ttl.setObjectName("insightBlockTitle")
+        top.addWidget(ttl)
+        top.addStretch()
+        lbl_lim = QLabel("Limite por categoria:")
+        lbl_lim.setObjectName("insightMuted")
+        top.addWidget(lbl_lim)
+        spin = QDoubleSpinBox()
+        spin.setObjectName("insightLimitSpin")
+        spin.setRange(0.0, 10_000_000.0)
+        spin.setDecimals(2)
+        spin.setSingleStep(100.0)
+        spin.setPrefix("R$ ")
+        spin.setValue(float(self._expense_limit or 0.0))
+        spin.valueChanged.connect(self._on_expense_limit_changed)
+        top.addWidget(spin)
+        lay.addLayout(top)
+
+        cats = dict(data.get("categorias", {}) or {})
+        colors = ["#1a6b7c", "#2563eb", "#e67e22", "#7c3aed", "#16a34a", "#d97706", "#c0392b"]
+        slices: list[tuple[str, float, str]] = []
+        sorted_cats = sorted(cats.items(), key=lambda x: float(x[1] or 0.0), reverse=True)
+        for idx, (cat, val) in enumerate(sorted_cats[:7]):
+            slices.append((str(cat), float(val or 0.0), colors[idx % len(colors)]))
+        pie = SimplePieChart()
+        pie.set_slices(slices)
+        lay.addWidget(pie)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(
+            self._make_stat_card(
+                "Despesas mês atual",
+                br_money(data.get("total_atual", 0.0)),
+                "Total previsto do mês",
+            ),
+            1,
+        )
+        delta = float(data.get("delta", 0.0) or 0.0)
+        pct = float(data.get("pct", 0.0) or 0.0)
+        row.addWidget(
+            self._make_stat_card(
+                "Comparativo com mês anterior",
+                f"{pct:+.1f}% ({br_money(delta)})",
+                f"Mês atual vs {_iso_to_mes_br(str(data.get('mes_anterior', '') or ''))}",
+                tone="danger" if delta > 0 else "success",
+            ),
+            1,
+        )
+        lay.addLayout(row)
+
+        limit = float(self._expense_limit or 0.0)
+        excedentes = [(cat, val) for cat, val in sorted_cats if float(val or 0.0) > limit > 0]
+        if excedentes:
+            txt = "⚠ Categorias acima do limite: " + ", ".join(f"{c} ({br_money(v)})" for c, v in excedentes[:4])
+            warn = QLabel(txt)
+            warn.setObjectName("insightAlertDanger")
+            lay.addWidget(warn)
+        else:
+            ok = QLabel("✓ Nenhuma categoria ultrapassou o limite configurado.")
+            ok.setObjectName("insightAlertGood")
+            lay.addWidget(ok)
+
+        top5 = list(data.get("top5", []) or [])
+        tbl_title = QLabel("Maiores despesas do mês (Top 5)")
+        tbl_title.setObjectName("insightBlockTitle")
+        lay.addWidget(tbl_title)
+        table = QTableWidget(0, 4)
+        table.setObjectName("insightTable")
+        table.setHorizontalHeaderLabels(["Descrição", "Categoria", "Fornecedor", "Valor"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.setRowCount(len(top5))
+        for i, r in enumerate(top5):
+            table.setItem(i, 0, QTableWidgetItem(str(r.get("descricao", "—") or "—")))
+            table.setItem(i, 1, QTableWidgetItem(str(r.get("categoria", "—") or "—")))
+            table.setItem(i, 2, QTableWidgetItem(str(r.get("fornecedor", "—") or "—")))
+            table.setItem(i, 3, QTableWidgetItem(br_money(float(r.get("valor", 0.0) or 0.0))))
+        table.setMinimumHeight(190)
+        lay.addWidget(table)
+        lay.addStretch(1)
+
+    def _render_fluxo_tab(self, data: dict):
+        lay = self._tab_layouts.get("fluxo")
+        if lay is None:
+            return
+        self._clear_layout(lay)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(
+            self._make_stat_card(
+                "Dias com saldo negativo",
+                str(int(data.get("negativos", 0) or 0)),
+                "Próximos 30 dias",
+                tone="danger" if int(data.get("negativos", 0) or 0) > 0 else "success",
+            ),
+            1,
+        )
+        row.addWidget(
+            self._make_stat_card(
+                "Horizonte analisado",
+                "30 dias",
+                "Entradas previstas vs saídas previstas",
+            ),
+            1,
+        )
+        lay.addLayout(row)
+
+        chart_title = QLabel("Linha do tempo do saldo projetado")
+        chart_title.setObjectName("insightBlockTitle")
+        lay.addWidget(chart_title)
+        chart = SimpleTrendChart(mode="line")
+        chart.set_series(list(data.get("labels", []) or []), list(data.get("saldo_series", []) or []), color="#2563eb")
+        lay.addWidget(chart)
+
+        table = QTableWidget(0, 4)
+        table.setObjectName("insightTable")
+        table.setHorizontalHeaderLabels(["Data", "Entradas", "Saídas", "Saldo Projetado"])
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
+        h = table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.Stretch)
+
+        rows = list(data.get("rows", []) or [])
+        table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            data_iso = str(r.get("data", "") or "")
+            table.setItem(i, 0, QTableWidgetItem(_date_to_br(data_iso)))
+            table.setItem(i, 1, QTableWidgetItem(br_money(float(r.get("entradas", 0.0) or 0.0))))
+            table.setItem(i, 2, QTableWidgetItem(br_money(float(r.get("saidas", 0.0) or 0.0))))
+            saldo = float(r.get("saldo", 0.0) or 0.0)
+            saldo_item = QTableWidgetItem(br_money(saldo))
+            if saldo < 0:
+                saldo_item.setForeground(QColor(_DANGER))
+                for col in range(0, 4):
+                    item = table.item(i, col)
+                    if item is None:
+                        item = QTableWidgetItem("")
+                        table.setItem(i, col, item)
+                    item.setBackground(QColor(255, 237, 237))
+            table.setItem(i, 3, saldo_item)
+
+        table.setMinimumHeight(250)
+        lay.addWidget(table)
+        lay.addStretch(1)
+
+    def _render_kpi_tab(self, data: dict):
+        lay = self._tab_layouts.get("kpi")
+        if lay is None:
+            return
+        self._clear_layout(lay)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
+        cards = [
+            ("Ticket médio", br_money(data.get("ticket_medio", 0.0)), "Por contrato ativo"),
+            ("Crescimento MoM", f"{float(data.get('crescimento', 0.0) or 0.0):+.1f}%", "Novos contratos do mês vs mês anterior"),
+            ("LTV estimado", br_money(data.get("ltv", 0.0)), "Ticket médio × tempo médio de permanência"),
+            ("Churn (snapshot)", f"{float(data.get('churn', 0.0) or 0.0):.1f}%", "Base atual de clientes ativos/inativos"),
+            ("MRR", br_money(data.get("mrr", 0.0)), "Receita Recorrente Mensal estimada"),
+            ("Contratos ativos", str(int(data.get("ativos", 0) or 0)), "Base ativa atual"),
+        ]
+        for i, (title, value, sub) in enumerate(cards):
+            tone = "danger" if ("Churn" in title and float(data.get("churn", 0.0) or 0.0) > 8) else ""
+            grid.addWidget(self._make_stat_card(title, value, sub, tone=tone), i // 3, i % 3)
+        lay.addLayout(grid)
+        note = QLabel(
+            "Indicadores calculados com base nos registros atuais de clientes, empresas, pagamentos e contas."
+        )
+        note.setObjectName("insightMuted")
+        note.setWordWrap(True)
+        lay.addWidget(note)
+        lay.addStretch(1)
+
+    # ── relatório PDF ────────────────────────────────────────────────────────
+    def _ensure_all_tab_data(self):
+        for key, _ in self.TAB_ORDER:
+            if key in self._tab_data:
+                continue
+            fn = self._compute_map.get(key)
+            if fn is None:
+                continue
+            try:
+                self._tab_data[key] = dict(fn() or {})
+                self._tab_loaded[key] = True
+            except Exception as exc:
+                self._tab_data[key] = {"error": str(exc)}
+
+    def _build_pdf_html(self) -> str:
+        self._ensure_all_tab_data()
+        resumo = dict(self._tab_data.get("resumo", {}) or {})
+        inad = dict(self._tab_data.get("inadimplencia", {}) or {})
+        receita = dict(self._tab_data.get("receita", {}) or {})
+        desp = dict(self._tab_data.get("despesas", {}) or {})
+        fluxo = dict(self._tab_data.get("fluxo", {}) or {})
+        kpi = dict(self._tab_data.get("kpi", {}) or {})
+
+        top5 = list(inad.get("top5", []) or [])
+        top5_html = "".join(
+            f"<tr><td>{str(r.get('nome', '—'))}</td><td>{br_money(r.get('valor', 0.0))}</td><td>{int(r.get('dias', 0) or 0)}</td></tr>"
+            for r in top5
+        ) or "<tr><td colspan='3'>Sem devedores no período.</td></tr>"
+
+        return f"""
+        <html>
+        <head>
+            <meta charset="utf-8" />
+            <style>
+                body {{ font-family: Arial, sans-serif; color: #111827; font-size: 11px; }}
+                h1 {{ font-size: 18px; margin-bottom: 2px; }}
+                h2 {{ font-size: 13px; margin: 16px 0 6px 0; color: #1a6b7c; }}
+                p {{ margin: 4px 0; }}
+                table {{ width: 100%; border-collapse: collapse; margin-top: 6px; }}
+                th, td {{ border: 1px solid #e5e7eb; padding: 6px; text-align: left; }}
+                th {{ background: #f9fafb; }}
+                .muted {{ color: #6b7280; }}
+            </style>
+        </head>
+        <body>
+            <h1>Insights Financeiros - {_iso_to_mes_br(self._mes_ref)}</h1>
+            <p class="muted">Relatório gerado em {datetime.now().strftime("%d/%m/%Y %H:%M")}</p>
+
+            <h2>Resumo do Mês</h2>
+            <p>Total recebido: <strong>{br_money(resumo.get("recebido", 0.0))}</strong></p>
+            <p>Total em aberto: <strong>{br_money(resumo.get("aberto", 0.0))}</strong></p>
+            <p>Total vencido: <strong>{br_money(resumo.get("vencido", 0.0))}</strong></p>
+            <p>Despesas pagas: <strong>{br_money(resumo.get("despesas_pagas", 0.0))}</strong></p>
+            <p>Saldo líquido: <strong>{br_money(resumo.get("saldo", 0.0))}</strong></p>
+
+            <h2>Inadimplência</h2>
+            <p>Taxa: <strong>{float(inad.get("taxa", 0.0) or 0.0):.2f}%</strong> ({int(inad.get("atrasados", 0) or 0)} de {int(inad.get("ativos", 0) or 0)} contratos)</p>
+            <table>
+                <thead><tr><th>Devedor</th><th>Valor em aberto</th><th>Dias em atraso</th></tr></thead>
+                <tbody>{top5_html}</tbody>
+            </table>
+
+            <h2>Receita</h2>
+            <p>Receita atual: <strong>{br_money(receita.get("atual", 0.0))}</strong></p>
+            <p>Mesmo mês ano anterior: <strong>{br_money(receita.get("ano_anterior", 0.0))}</strong></p>
+            <p>Variação YoY: <strong>{float(receita.get("pct", 0.0) or 0.0):+.2f}%</strong> ({br_money(receita.get("delta", 0.0))})</p>
+            <p>Média últimos 6 meses: <strong>{br_money(receita.get("media_6", 0.0))}</strong></p>
+            <p>Projeção do mês corrente: <strong>{br_money(receita.get("projecao", 0.0))}</strong></p>
+
+            <h2>Despesas</h2>
+            <p>Total atual: <strong>{br_money(desp.get("total_atual", 0.0))}</strong></p>
+            <p>Total mês anterior: <strong>{br_money(desp.get("total_prev", 0.0))}</strong></p>
+            <p>Variação: <strong>{float(desp.get("pct", 0.0) or 0.0):+.2f}%</strong> ({br_money(desp.get("delta", 0.0))})</p>
+
+            <h2>Fluxo de Caixa (30 dias)</h2>
+            <p>Dias com saldo negativo projetado: <strong>{int(fluxo.get("negativos", 0) or 0)}</strong></p>
+
+            <h2>Indicadores KPI</h2>
+            <p>Ticket médio: <strong>{br_money(kpi.get("ticket_medio", 0.0))}</strong></p>
+            <p>Crescimento MoM: <strong>{float(kpi.get("crescimento", 0.0) or 0.0):+.2f}%</strong></p>
+            <p>LTV estimado: <strong>{br_money(kpi.get("ltv", 0.0))}</strong></p>
+            <p>Churn (snapshot): <strong>{float(kpi.get("churn", 0.0) or 0.0):.2f}%</strong></p>
+            <p>MRR: <strong>{br_money(kpi.get("mrr", 0.0))}</strong></p>
+        </body>
+        </html>
+        """
+
+    def _export_pdf_report(self):
+        default_name = f"insights_financeiros_{self._mes_ref.replace('-', '')}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+        base_dir = os.path.expanduser("~")
+        file_path, _ = QFileDialog.getSaveFileName(self, "Salvar relatório PDF", os.path.join(base_dir, default_name), "PDF (*.pdf)")
+        if not file_path:
+            return
+        if not str(file_path).lower().endswith(".pdf"):
+            file_path = f"{file_path}.pdf"
+        try:
+            html = self._build_pdf_html()
+            printer = QPrinter(QPrinter.HighResolution)
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(str(file_path))
+            printer.setPageMargins(12, 12, 12, 12, QPrinter.Millimeter)
+            doc = QTextDocument()
+            doc.setHtml(html)
+            doc.print(printer)
+            QMessageBox.information(self, "Relatório PDF", f"Relatório gerado com sucesso:\n{file_path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Relatório PDF", f"Não foi possível gerar o PDF.\n\n{exc}")
+
 # ── Cartão KPI melhorado ──────────────────────────────────────────────────────
 class _KpiCard(QFrame):
     """Cartão de métrica individual com borda superior colorida e animação"""
@@ -2005,9 +2885,14 @@ class FinanceiroView(QWidget):
         self._contas_last_refresh_at = ""
         self._previous_month_data = {}  # NOVO: para comparação
         self.nivel_usuario = "—"
+        self._rows_page_size = 50
         self._contas_page_size = 50
         self._contas_sort_key = "data_vencimento"
         self._contas_sort_dir = "asc"
+        self._contas_only_vencidas = False
+        self._contas_vencem_hoje = False
+        self._contas_vencem_7d = False
+        self._density_mode = "normal"
 
         self._filter_timer = QTimer(self)
         self._filter_timer.setSingleShot(True)
@@ -2056,6 +2941,10 @@ class FinanceiroView(QWidget):
         # Ctrl+L - Limpar filtros
         shortcut_clear = QShortcut(QKeySequence("Ctrl+L"), self)
         shortcut_clear.activated.connect(self._clear_filters)
+
+        # Ctrl+I - Insights
+        shortcut_insights = QShortcut(QKeySequence("Ctrl+I"), self)
+        shortcut_insights.activated.connect(self._show_insights)
         
         # Esc - Voltar
         shortcut_back = QShortcut(QKeySequence("Esc"), self)
@@ -2094,6 +2983,7 @@ class FinanceiroView(QWidget):
         root = QVBoxLayout(page)
         root.setContentsMargins(20, 18, 20, 18)
         root.setSpacing(14)
+        self._root_layout = root
 
         # ── cabeçalho ─────────────────────────────────────────────────────────
         hdr = QHBoxLayout()
@@ -2158,6 +3048,7 @@ class FinanceiroView(QWidget):
 
         row1 = QHBoxLayout()
         row1.setSpacing(8)
+        self._toolbar_row1 = row1
 
         self.btn_prev_month = QPushButton("‹")
         self.btn_prev_month.setObjectName("monthNav")
@@ -2238,6 +3129,7 @@ class FinanceiroView(QWidget):
 
         row2 = QHBoxLayout()
         row2.setSpacing(8)
+        self._toolbar_row2 = row2
 
         self.chip_atrasados = QPushButton("Somente atrasados")
         self.chip_atrasados.setObjectName("chip")
@@ -2265,6 +3157,24 @@ class FinanceiroView(QWidget):
         tl.addLayout(row2)
 
         root.addWidget(toolbar)
+
+        # ── tabs principais ──────────────────────────────────────────────────
+        self.main_tabs = QTabWidget()
+        self.main_tabs.setObjectName("finTabs")
+        root.addWidget(self.main_tabs, 1)
+
+        visao_tab = QWidget()
+        visao_tab_lay = QVBoxLayout(visao_tab)
+        visao_tab_lay.setContentsMargins(0, 0, 0, 0)
+        visao_tab_lay.setSpacing(12)
+
+        contas_tab = QWidget()
+        contas_tab_lay = QVBoxLayout(contas_tab)
+        contas_tab_lay.setContentsMargins(0, 0, 0, 0)
+        contas_tab_lay.setSpacing(12)
+
+        self.main_tabs.addTab(visao_tab, "Visão Geral")
+        self.main_tabs.addTab(contas_tab, "Contas a Pagar")
 
         # ── KPI cards (2 × 2) com gráfico de pizza ────────────────────────────
         kpi_row = QHBoxLayout()
@@ -2312,40 +3222,11 @@ class FinanceiroView(QWidget):
         pie_layout.addStretch()
         
         kpi_row.addWidget(pie_card, 1)
-        root.addLayout(kpi_row)
-
-        # ── NOVO: Container de insights ───────────────────────────────────────
-        self.insights_container = QFrame()
-        self.insights_container.setObjectName("insightsContainer")
-        self.insights_container.setVisible(False)
-        
-        insights_layout = QVBoxLayout(self.insights_container)
-        insights_layout.setContentsMargins(0, 0, 0, 0)
-        insights_layout.setSpacing(8)
-        
-        insights_header = QHBoxLayout()
-        insights_title = QLabel("💡 Insights Automáticos")
-        insights_title.setFont(QFont("Segoe UI", 13, QFont.DemiBold))
-        insights_header.addWidget(insights_title)
-        insights_header.addStretch()
-        
-        self.btn_hide_insights = QPushButton("✕")
-        self.btn_hide_insights.setObjectName("btnCloseInsights")
-        self.btn_hide_insights.setFixedSize(24, 24)
-        self.btn_hide_insights.clicked.connect(lambda: self.insights_container.setVisible(False))
-        insights_header.addWidget(self.btn_hide_insights)
-        
-        insights_layout.addLayout(insights_header)
-        
-        self.insights_list = QVBoxLayout()
-        self.insights_list.setSpacing(8)
-        insights_layout.addLayout(self.insights_list)
-        
-        root.addWidget(self.insights_container)
+        visao_tab_lay.addLayout(kpi_row)
 
         # ── gráfico ───────────────────────────────────────────────────────────
         self.chart = DailyRevenueChart()
-        root.addWidget(self.chart)
+        visao_tab_lay.addWidget(self.chart)
 
         # ── tabela ────────────────────────────────────────────────────────────
         table_card = QFrame()
@@ -2398,7 +3279,7 @@ class FinanceiroView(QWidget):
         self.empty_state.setVisible(False)
         tw.addWidget(self.empty_state)
 
-        root.addWidget(table_card, 1)
+        visao_tab_lay.addWidget(table_card, 1)
 
         # ── contas a pagar ───────────────────────────────────────────────────
         contas_card = QFrame()
@@ -2420,6 +3301,7 @@ class FinanceiroView(QWidget):
 
         contas_filters = QHBoxLayout()
         contas_filters.setSpacing(8)
+        self._contas_filters_layout = contas_filters
 
         self.contas_status_combo = QComboBox()
         self.contas_status_combo.setObjectName("filterCombo")
@@ -2481,6 +3363,37 @@ class FinanceiroView(QWidget):
         contas_filters.addWidget(self.btn_contas_export)
         cw.addLayout(contas_filters)
 
+        contas_presets = QHBoxLayout()
+        contas_presets.setSpacing(8)
+        self._contas_presets_layout = contas_presets
+
+        self.chip_contas_vencidas = QPushButton("Somente vencidas")
+        self.chip_contas_vencidas.setObjectName("chip")
+        self.chip_contas_vencidas.setCheckable(True)
+        self.chip_contas_vencidas.toggled.connect(
+            lambda checked: self._set_contas_quick_preset("vencidas" if checked else "")
+        )
+
+        self.chip_contas_hoje = QPushButton("Vencem hoje")
+        self.chip_contas_hoje.setObjectName("chip")
+        self.chip_contas_hoje.setCheckable(True)
+        self.chip_contas_hoje.toggled.connect(
+            lambda checked: self._set_contas_quick_preset("hoje" if checked else "")
+        )
+
+        self.chip_contas_7d = QPushButton("Próximos 7 dias")
+        self.chip_contas_7d.setObjectName("chip")
+        self.chip_contas_7d.setCheckable(True)
+        self.chip_contas_7d.toggled.connect(
+            lambda checked: self._set_contas_quick_preset("7d" if checked else "")
+        )
+
+        contas_presets.addWidget(self.chip_contas_vencidas)
+        contas_presets.addWidget(self.chip_contas_hoje)
+        contas_presets.addWidget(self.chip_contas_7d)
+        contas_presets.addStretch()
+        cw.addLayout(contas_presets)
+
         self.contas_table = QTableWidget(0, 8)
         self.contas_table.setObjectName("dataTable")
         self.contas_table.setHorizontalHeaderLabels(
@@ -2524,7 +3437,7 @@ class FinanceiroView(QWidget):
         self.btn_contas_pagar.setEnabled(False)
         self.btn_contas_excluir.setEnabled(False)
 
-        root.addWidget(contas_card, 1)
+        contas_tab_lay.addWidget(contas_card, 1)
 
         # ── mensagem de erro inline ───────────────────────────────────────────
         self.msg = QLabel("")
@@ -2549,6 +3462,39 @@ class FinanceiroView(QWidget):
         }}
         QWidget#financeiroPage {{
             background: {_BG};
+        }}
+
+        /* ── tabs principais ─────────────────────────────────────────── */
+        QTabWidget#finTabs::pane {{
+            border: 1px solid {_LINE};
+            border-radius: 12px;
+            background: {_WHITE};
+            margin-top: 6px;
+        }}
+        QTabWidget#finTabs::tab-bar {{
+            alignment: left;
+        }}
+        QTabWidget#finTabs QTabBar::tab {{
+            background: rgba(26,107,124,0.06);
+            border: 1px solid rgba(26,107,124,0.20);
+            border-bottom: none;
+            border-top-left-radius: 10px;
+            border-top-right-radius: 10px;
+            padding: 8px 16px;
+            margin-right: 6px;
+            color: {_INK2};
+            font-size: 12px;
+            font-weight: 600;
+            font-family: '{f}', 'Segoe UI', sans-serif;
+        }}
+        QTabWidget#finTabs QTabBar::tab:selected {{
+            background: {_WHITE};
+            color: {_ACCENT};
+            border-color: {_ACCENT};
+        }}
+        QTabWidget#finTabs QTabBar::tab:hover {{
+            color: {_ACCENT};
+            border-color: rgba(26,107,124,0.32);
         }}
 
         /* ── tipografia de cabeçalho ──────────────────────────────────── */
@@ -2626,18 +3572,6 @@ class FinanceiroView(QWidget):
         }}
         QPushButton#btnGhost:hover {{ color: {_INK}; border-color: #c0c7d0; }}
 
-        QPushButton#btnCloseInsights {{
-            background: transparent;
-            color: {_INK3};
-            border: 1px solid {_LINE};
-            border-radius: 12px;
-            font-size: 14px;
-        }}
-        QPushButton#btnCloseInsights:hover {{
-            background: rgba(192,57,43,0.1);
-            color: {_DANGER};
-            border-color: {_DANGER};
-        }}
 
         /* ── barra de filtros ─────────────────────────────────────────── */
         QFrame#filterBar {{
@@ -2742,14 +3676,6 @@ class FinanceiroView(QWidget):
             font-size: 11px;
             color: {_INK3};
             font-family: '{f}', 'Segoe UI', sans-serif;
-        }}
-
-        /* ── insights container ───────────────────────────────────────── */
-        QFrame#insightsContainer {{
-            background: {_WHITE};
-            border: 1px solid {_LINE};
-            border-radius: 12px;
-            padding: 14px;
         }}
 
         /* ── gráfico ──────────────────────────────────────────────────── */
@@ -2863,62 +3789,99 @@ class FinanceiroView(QWidget):
             color: {_DANGER};
             font-family: '{f}', 'Segoe UI', sans-serif;
         }}
+
         """)
 
     # ── NOVO: Análises automáticas ────────────────────────────────────────────
     def _show_insights(self):
-        """Executa análise e mostra insights"""
-        if not self._rows_cache:
-            self.show_error("Não há dados suficientes para análise.")
-            return
-        
-        # Limpa insights anteriores
-        while self.insights_list.count():
-            item = self.insights_list.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        # Mostra loading
-        loading = QLabel("Analisando dados...")
-        loading.setFont(QFont("Segoe UI", 11))
-        loading.setStyleSheet(f"color: {_INK2}; padding: 10px;")
-        self.insights_list.addWidget(loading)
-        self.insights_container.setVisible(True)
-        
-        # Executa análise em thread
-        worker = DataAnalysisWorker(self._rows_cache, self._ticket_ref)
-        worker.signals.finished.connect(self._on_analysis_finished)
-        self.threadpool.start(worker)
-    
-    def _on_analysis_finished(self, result: dict):
-        """Callback quando análise termina"""
-        # Remove loading
-        while self.insights_list.count():
-            item = self.insights_list.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        insights = result.get("insights", [])
-        
-        if not insights:
-            no_insights = QLabel("✓ Nenhum ponto de atenção detectado.")
-            no_insights.setFont(QFont("Segoe UI", 11))
-            no_insights.setStyleSheet(f"color: {_GOOD}; padding: 10px;")
-            self.insights_list.addWidget(no_insights)
-        else:
-            for insight in insights:
-                card = InsightCard(
-                    insight.get("icon", "ℹ️"),
-                    insight.get("title", "Insight"),
-                    insight.get("message", ""),
-                    insight.get("kind", "info")
-                )
-                self.insights_list.addWidget(card)
+        """Abre modal de insights financeiros com abas e carregamento lazy."""
+        dlg = FinanceInsightsModal(self.current_month(), self.window() or self)
+        dlg.exec()
 
     # ── API pública melhorada ─────────────────────────────────────────────────
     def set_nivel_usuario(self, nivel: str):
         self.nivel_usuario = (nivel or "—").strip()
         self.lbl_subtitle.setText(f"Painel financeiro  ·  Nível: {self.nivel_usuario}")
+
+    def set_density(self, density: str):
+        mode = str(density or "").strip().lower()
+        if mode not in {"normal", "compact"}:
+            mode = "normal"
+        self._density_mode = mode
+        compact = mode == "compact"
+
+        try:
+            if hasattr(self, "_root_layout"):
+                if compact:
+                    self._root_layout.setContentsMargins(14, 12, 14, 12)
+                    self._root_layout.setSpacing(10)
+                else:
+                    self._root_layout.setContentsMargins(20, 18, 20, 18)
+                    self._root_layout.setSpacing(14)
+            if hasattr(self, "_toolbar_row1"):
+                self._toolbar_row1.setSpacing(6 if compact else 8)
+            if hasattr(self, "_toolbar_row2"):
+                self._toolbar_row2.setSpacing(6 if compact else 8)
+            if hasattr(self, "_contas_filters_layout"):
+                self._contas_filters_layout.setSpacing(6 if compact else 8)
+            if hasattr(self, "_contas_presets_layout"):
+                self._contas_presets_layout.setSpacing(6 if compact else 8)
+        except Exception:
+            pass
+
+        header_h = 34 if compact else 38
+        filter_h = 32 if compact else 36
+        contas_h = 30 if compact else 34
+        nav_h = 32 if compact else 36
+
+        for w in (
+            getattr(self, "btn_analyze", None),
+            getattr(self, "btn_export", None),
+            getattr(self, "btn_refresh", None),
+            getattr(self, "btn_voltar", None),
+        ):
+            if w is not None:
+                w.setFixedHeight(header_h)
+
+        if hasattr(self, "btn_prev_month"):
+            self.btn_prev_month.setFixedSize(30 if compact else 32, nav_h)
+        if hasattr(self, "btn_next_month"):
+            self.btn_next_month.setFixedSize(30 if compact else 32, nav_h)
+
+        for w in (
+            getattr(self, "month_combo", None),
+            getattr(self, "status_combo", None),
+            getattr(self, "search", None),
+            getattr(self, "name_filter", None),
+            getattr(self, "min_value", None),
+            getattr(self, "max_value", None),
+            getattr(self, "btn_clear", None),
+        ):
+            if w is not None:
+                w.setFixedHeight(filter_h)
+
+        for w in (
+            getattr(self, "contas_status_combo", None),
+            getattr(self, "contas_search", None),
+            getattr(self, "btn_contas_refresh", None),
+            getattr(self, "btn_contas_nova", None),
+            getattr(self, "btn_contas_editar", None),
+            getattr(self, "btn_contas_pagar", None),
+            getattr(self, "btn_contas_excluir", None),
+            getattr(self, "btn_contas_export", None),
+        ):
+            if w is not None:
+                w.setFixedHeight(contas_h)
+
+        kpi_h = 98 if compact else 110
+        for card in (
+            getattr(self, "kpi_receita", None),
+            getattr(self, "kpi_pagamentos", None),
+            getattr(self, "kpi_ticket", None),
+            getattr(self, "kpi_atraso", None),
+        ):
+            if card is not None:
+                card.setMinimumHeight(kpi_h)
 
     def set_month_options(self, months: list[str], current_month: str | None = None):
         current = (current_month or "").strip()
@@ -2955,7 +3918,7 @@ class FinanceiroView(QWidget):
         status_key = str(self.status_combo.currentData() or "").strip().lower()
         return {
             "page": 0,
-            "page_size": 50,
+            "page_size": int(self._rows_page_size or 50),
             "search_doc": (self.search.text() or "").strip(),
             "search_name": (self.name_filter.text() or "").strip(),
             "status_key": status_key,
@@ -2969,6 +3932,21 @@ class FinanceiroView(QWidget):
             "sort_dir": "desc",
         }
 
+    def set_page_sizes(self, pagamentos_page_size: int | None = None, contas_page_size: int | None = None):
+        allowed = {25, 50, 75, 100, 200}
+        if pagamentos_page_size is not None:
+            try:
+                page = int(pagamentos_page_size)
+            except Exception:
+                page = 50
+            self._rows_page_size = page if page in allowed else 50
+        if contas_page_size is not None:
+            try:
+                page = int(contas_page_size)
+            except Exception:
+                page = 50
+            self._contas_page_size = page if page in allowed else 50
+
     def current_contas_query(self) -> dict:
         status = str(self.contas_status_combo.currentData() or "").strip().lower()
         return {
@@ -2979,12 +3957,101 @@ class FinanceiroView(QWidget):
             "categoria": "",
             "min_value": None,
             "max_value": None,
-            "only_vencidas": status == "vencida",
-            "vencem_hoje": False,
-            "vencem_7d": False,
+            "only_vencidas": bool(self._contas_only_vencidas or status == "vencida"),
+            "vencem_hoje": bool(self._contas_vencem_hoje),
+            "vencem_7d": bool(self._contas_vencem_7d),
             "sort_key": str(self._contas_sort_key or "data_vencimento"),
             "sort_dir": str(self._contas_sort_dir or "asc"),
         }
+
+    def _set_contas_quick_preset(self, preset: str, *, emit_remote: bool = True):
+        key = str(preset or "").strip().lower()
+        self._contas_only_vencidas = key == "vencidas"
+        self._contas_vencem_hoje = key == "hoje"
+        self._contas_vencem_7d = key == "7d"
+
+        self.chip_contas_vencidas.blockSignals(True)
+        self.chip_contas_hoje.blockSignals(True)
+        self.chip_contas_7d.blockSignals(True)
+        self.chip_contas_vencidas.setChecked(self._contas_only_vencidas)
+        self.chip_contas_hoje.setChecked(self._contas_vencem_hoje)
+        self.chip_contas_7d.setChecked(self._contas_vencem_7d)
+        self.chip_contas_vencidas.blockSignals(False)
+        self.chip_contas_hoje.blockSignals(False)
+        self.chip_contas_7d.blockSignals(False)
+        if emit_remote:
+            self._schedule_contas_filter()
+        else:
+            self._apply_contas_filter(emit_remote=False)
+
+    def apply_saved_query(self, query: dict | None, *, emit_remote: bool = False):
+        src = dict(query or {})
+        fields = [
+            self.status_combo,
+            self.search,
+            self.name_filter,
+            self.min_value,
+            self.max_value,
+            self.chip_atrasados,
+            self.chip_ticket,
+            self.chip_hoje,
+        ]
+        for f in fields:
+            f.blockSignals(True)
+
+        status_key = str(src.get("status_key", "") or "").strip().lower()
+        status_idx = 0
+        for i in range(self.status_combo.count()):
+            if str(self.status_combo.itemData(i) or "").strip().lower() == status_key:
+                status_idx = i
+                break
+        self.status_combo.setCurrentIndex(status_idx)
+        self.search.setText(str(src.get("search_doc", "") or ""))
+        self.name_filter.setText(str(src.get("search_name", "") or ""))
+
+        min_value = src.get("min_value")
+        max_value = src.get("max_value")
+        try:
+            self.min_value.setText("" if min_value in (None, "") else br_money(float(min_value)))
+        except Exception:
+            self.min_value.setText("")
+        try:
+            self.max_value.setText("" if max_value in (None, "") else br_money(float(max_value)))
+        except Exception:
+            self.max_value.setText("")
+        self.chip_atrasados.setChecked(bool(src.get("only_atrasados", False)))
+        self.chip_ticket.setChecked(bool(src.get("above_ticket", False)))
+        self.chip_hoje.setChecked(bool(src.get("only_today", False)))
+
+        for f in fields:
+            f.blockSignals(False)
+        self._apply_filter(emit_remote=emit_remote)
+
+    def apply_saved_contas_query(self, query: dict | None, *, emit_remote: bool = False):
+        src = dict(query or {})
+        self.contas_status_combo.blockSignals(True)
+        self.contas_search.blockSignals(True)
+
+        status = str(src.get("status", "") or "").strip().lower()
+        idx = 0
+        for i in range(self.contas_status_combo.count()):
+            if str(self.contas_status_combo.itemData(i) or "").strip().lower() == status:
+                idx = i
+                break
+        self.contas_status_combo.setCurrentIndex(idx)
+        self.contas_search.setText(str(src.get("search", "") or ""))
+
+        self.contas_status_combo.blockSignals(False)
+        self.contas_search.blockSignals(False)
+
+        if bool(src.get("vencem_hoje", False)):
+            self._set_contas_quick_preset("hoje", emit_remote=emit_remote)
+        elif bool(src.get("vencem_7d", False)):
+            self._set_contas_quick_preset("7d", emit_remote=emit_remote)
+        elif bool(src.get("only_vencidas", False)):
+            self._set_contas_quick_preset("vencidas", emit_remote=emit_remote)
+        else:
+            self._set_contas_quick_preset("", emit_remote=emit_remote)
 
     def _prev_month(self):
         idx = self.month_combo.currentIndex()
@@ -3133,6 +4200,9 @@ class FinanceiroView(QWidget):
         for w in (
             self.contas_status_combo,
             self.contas_search,
+            self.chip_contas_vencidas,
+            self.chip_contas_hoje,
+            self.chip_contas_7d,
             self.btn_contas_nova,
             self.btn_contas_editar,
             self.btn_contas_pagar,
@@ -3261,7 +4331,7 @@ class FinanceiroView(QWidget):
             "ticket": ticket,
         }
         
-        self._apply_filter()
+        self._apply_filter(emit_remote=False)
         self.show_error("")
 
     def set_contas_month_options(self, months: list[str], current_month: str | None = None):
@@ -3282,7 +4352,7 @@ class FinanceiroView(QWidget):
         self.show_contas_error("")
 
     # ── filtro ────────────────────────────────────────────────────────────────
-    def _apply_filter(self):
+    def _apply_filter(self, emit_remote: bool = True):
         term_doc_raw  = (self.search.text()      or "").strip()
         term_doc      = _norm_text(term_doc_raw)
         term_doc_dig  = _only_digits(term_doc_raw)
@@ -3376,11 +4446,17 @@ class FinanceiroView(QWidget):
         self.btn_export.setEnabled((not self._is_loading) and len(out) > 0)
         if self.msg.isVisible():
             self.show_error("")
+        if emit_remote:
+            self.query_changed_signal.emit(self.current_query())
 
     def _apply_contas_filter(self, emit_remote: bool = True):
         term_raw = (self.contas_search.text() or "").strip()
         term = _norm_text(term_raw)
         status_key = str(self.contas_status_combo.currentData() or "").strip().lower()
+        only_vencidas = bool(self._contas_only_vencidas or status_key == "vencida")
+        vencem_hoje = bool(self._contas_vencem_hoje)
+        vencem_7d = bool(self._contas_vencem_7d)
+        today = datetime.now().date()
 
         out: list[dict] = []
         for r in self._contas_rows_cache:
@@ -3388,10 +4464,26 @@ class FinanceiroView(QWidget):
             cat = _norm_text(str(r.get("categoria", "") or ""))
             forn = _norm_text(str(r.get("fornecedor", "") or ""))
             status = str(r.get("status", "") or "").strip().lower()
+            data_venc = str(r.get("data_vencimento", "") or "").strip()
+            try:
+                venc_dt = datetime.strptime(data_venc, "%Y-%m-%d").date()
+            except Exception:
+                venc_dt = None
+            is_paid = status == "paga"
+            is_vencida = status == "vencida" or (venc_dt is not None and (not is_paid) and venc_dt < today)
+            diff_days = int((venc_dt - today).days) if venc_dt is not None else None
 
             if term and (term not in desc and term not in cat and term not in forn):
                 continue
-            if status_key and status != status_key:
+            if status_key and status_key != "vencida" and status != status_key:
+                continue
+            if status_key == "vencida" and not is_vencida:
+                continue
+            if only_vencidas and not is_vencida:
+                continue
+            if vencem_hoje and diff_days != 0:
+                continue
+            if vencem_7d and (diff_days is None or diff_days < 0 or diff_days > 7):
                 continue
             out.append(r)
 

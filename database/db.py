@@ -3,7 +3,7 @@
 import sqlite3
 import shutil
 from pathlib import Path
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from calendar import monthrange
 import base64
 import os
@@ -1205,12 +1205,228 @@ def _build_empresas_where_clause(
         params.append(forma)
 
     status = _safe_str(status_pagamento, "").strip().lower()
+    if status == "em_atraso":
+        status = "inadimplente"
     if status in {"em_dia", "pendente", "inadimplente"}:
         where.append(f"{alias}.status_pagamento = ?")
         params.append(status)
 
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     return where_sql, params
+
+
+def calcular_status_pagamento(cliente: dict, hoje: date | None = None) -> str:
+    """
+    Calcula status de pagamento dinamicamente para o mês corrente.
+
+    Regras:
+      - em_dia: existe pagamento confirmado/pago no mês atual
+      - em_atraso: não pagou no mês e hoje já passou do dia de vencimento
+      - pendente: não pagou no mês e vencimento ainda não chegou
+    """
+    data_ref = hoje if isinstance(hoje, date) else datetime.now().date()
+    mes_ref = data_ref.strftime("%Y-%m")
+
+    dia_vencimento = _safe_int(
+        (cliente or {}).get("dia_vencimento", (cliente or {}).get("vencimento_dia", 0)),
+        0,
+    )
+    if dia_vencimento <= 0:
+        dia_vencimento = 10
+    dia_vencimento = max(1, min(31, dia_vencimento))
+    ultimo_dia_mes = int(monthrange(data_ref.year, data_ref.month)[1])
+    dia_corte = min(dia_vencimento, ultimo_dia_mes)
+
+    pago_mes = bool((cliente or {}).get("pagamento_mes_atual", False))
+    if not pago_mes:
+        pagamentos = list((cliente or {}).get("pagamentos", []) or [])
+        for p in pagamentos:
+            if not isinstance(p, dict):
+                continue
+            mes_item = _normalize_month_reference_iso_loose(p.get("mes_referencia"))
+            if mes_item != mes_ref:
+                continue
+            status_item = _safe_str(p.get("status"), "").strip().lower()
+            # Em bases sem status explícito no lançamento, existência da linha
+            # já indica pagamento confirmado.
+            if status_item in {"", "pago", "confirmado", "paid", "confirmed", "em_dia"}:
+                pago_mes = True
+                break
+
+    if pago_mes:
+        return "em_dia"
+    if int(data_ref.day) > int(dia_corte):
+        return "em_atraso"
+    return "pendente"
+
+
+_STATUS_SYNC_CLIENTES_LOCK = threading.Lock()
+_STATUS_SYNC_CLIENTES_LAST_TS = 0.0
+_STATUS_SYNC_CLIENTES_LAST_DAY = ""
+_STATUS_SYNC_CLIENTES_LAST_MONTH = ""
+_STATUS_SYNC_CLIENTES_LAST_RESULT: dict = {
+    "mes_ref": "",
+    "total_clientes": 0,
+    "atrasados": 0,
+    "atualizados": 0,
+    "skipped": False,
+}
+
+
+def _status_sync_min_interval_s() -> int:
+    try:
+        return max(0, int(str(os.getenv("MEDCONTRACT_STATUS_SYNC_MIN_INTERVAL_S", "45")).strip()))
+    except Exception:
+        return 45
+
+
+def _should_skip_status_sync_clientes(data_ref: date, *, force: bool = False) -> tuple[bool, dict]:
+    if force:
+        return False, {}
+
+    now_mono = time.monotonic()
+    day_key = data_ref.isoformat()
+    month_key = data_ref.strftime("%Y-%m")
+    min_interval = _status_sync_min_interval_s()
+
+    with _STATUS_SYNC_CLIENTES_LOCK:
+        elapsed = float(now_mono - float(_STATUS_SYNC_CLIENTES_LAST_TS or 0.0))
+        if (
+            _STATUS_SYNC_CLIENTES_LAST_DAY == day_key
+            and _STATUS_SYNC_CLIENTES_LAST_MONTH == month_key
+            and elapsed < float(min_interval)
+        ):
+            out = dict(_STATUS_SYNC_CLIENTES_LAST_RESULT or {})
+            out["skipped"] = True
+            out["reason"] = "throttled"
+            return True, out
+    return False, {}
+
+
+def _store_status_sync_clientes_result(data_ref: date, out: dict) -> None:
+    now_mono = time.monotonic()
+    month_key = data_ref.strftime("%Y-%m")
+    day_key = data_ref.isoformat()
+    payload = {
+        "mes_ref": str((out or {}).get("mes_ref") or month_key),
+        "total_clientes": int((out or {}).get("total_clientes", 0) or 0),
+        "atrasados": int((out or {}).get("atrasados", 0) or 0),
+        "atualizados": int((out or {}).get("atualizados", 0) or 0),
+        "skipped": bool((out or {}).get("skipped", False)),
+    }
+    with _STATUS_SYNC_CLIENTES_LOCK:
+        global _STATUS_SYNC_CLIENTES_LAST_TS, _STATUS_SYNC_CLIENTES_LAST_DAY
+        global _STATUS_SYNC_CLIENTES_LAST_MONTH, _STATUS_SYNC_CLIENTES_LAST_RESULT
+        _STATUS_SYNC_CLIENTES_LAST_TS = float(now_mono)
+        _STATUS_SYNC_CLIENTES_LAST_DAY = day_key
+        _STATUS_SYNC_CLIENTES_LAST_MONTH = month_key
+        _STATUS_SYNC_CLIENTES_LAST_RESULT = payload
+
+
+def _sincronizar_status_pagamento_clientes_cursor(cur, hoje: date | None = None, *, force: bool = False) -> dict:
+    """
+    Sincroniza o campo clientes.pagamento_status com base no mês corrente:
+      - atrasado: sem pagamento no mês e vencimento já passou
+      - em_dia: demais casos (incluindo vencimento ainda não alcançado)
+
+    Clientes inativos permanecem como em_dia.
+    """
+    data_ref = hoje if isinstance(hoje, date) else datetime.now().date()
+    skip, skip_payload = _should_skip_status_sync_clientes(data_ref, force=bool(force))
+    if skip:
+        return skip_payload
+
+    mes_ref = data_ref.strftime("%Y-%m")
+    pagos_mes = cliente_ids_pagamento_mes_cursor(cur, mes_ref)
+
+    cur.execute(
+        """
+        SELECT
+            id,
+            COALESCE(status, 'ativo') AS status,
+            COALESCE(vencimento_dia, 10) AS vencimento_dia,
+            COALESCE(pagamento_status, 'em_dia') AS pagamento_status
+        FROM clientes
+        """
+    )
+    rows = cur.fetchall() or []
+
+    updates: list[tuple[str, int]] = []
+    atrasados = 0
+    for row in rows:
+        cliente_id = _safe_int(row[0], 0)
+        status_cli = _safe_str(row[1], "ativo").strip().lower()
+        vencimento_dia = _safe_int(row[2], 10)
+        atual = _safe_str(row[3], "em_dia").strip().lower()
+
+        if status_cli == "inativo":
+            alvo = "em_dia"
+        else:
+            calc = calcular_status_pagamento(
+                {
+                    "vencimento_dia": vencimento_dia,
+                    "pagamento_mes_atual": cliente_id in pagos_mes,
+                },
+                hoje=data_ref,
+            )
+            alvo = "atrasado" if calc == "em_atraso" else "em_dia"
+            if alvo == "atrasado":
+                atrasados += 1
+
+        if atual not in {"em_dia", "atrasado"}:
+            atual = "em_dia"
+        if alvo != atual and cliente_id > 0:
+            updates.append((alvo, cliente_id))
+
+    if updates:
+        cur.executemany(
+            """
+            UPDATE clientes
+            SET pagamento_status = ?
+            WHERE id = ?
+            """,
+            updates,
+        )
+
+    out = {
+        "mes_ref": mes_ref,
+        "total_clientes": len(rows),
+        "atrasados": int(atrasados),
+        "atualizados": len(updates),
+        "skipped": False,
+    }
+    _store_status_sync_clientes_result(data_ref, out)
+    return out
+
+
+def sincronizar_status_pagamento_clientes(hoje: date | None = None, *, force: bool = False) -> dict:
+    data_ref = hoje if isinstance(hoje, date) else datetime.now().date()
+    skip, skip_payload = _should_skip_status_sync_clientes(data_ref, force=bool(force))
+    if skip:
+        return skip_payload
+
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        out = _sincronizar_status_pagamento_clientes_cursor(cur, hoje=data_ref, force=bool(force))
+        if int(out.get("atualizados", 0) or 0) > 0:
+            conn.commit()
+        return out
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print("Erro ao sincronizar status de pagamento dos clientes:", e)
+        return {
+            "mes_ref": _current_month_ref(),
+            "total_clientes": 0,
+            "atrasados": 0,
+            "atualizados": 0,
+            "skipped": False,
+        }
+    finally:
+        conn.close()
 
 
 def _get_user_version(cursor) -> int:
@@ -1247,6 +1463,13 @@ def _today_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+_MONTHS_NUM_TO_PT_BR = {
+    1: "JAN", 2: "FEV", 3: "MAR", 4: "ABR", 5: "MAI", 6: "JUN",
+    7: "JUL", 8: "AGO", 9: "SET", 10: "OUT", 11: "NOV", 12: "DEZ",
+}
+_MONTHS_PT_BR_TO_NUM = {v: k for k, v in _MONTHS_NUM_TO_PT_BR.items()}
+
+
 _CONTAS_STATUS = {"pendente", "paga", "vencida"}
 _CONTAS_CATEGORIAS = {
     "aluguel",
@@ -1268,14 +1491,361 @@ def _month_ref_to_br(mes_ref: str) -> str:
         try:
             year = ref[:4]
             month = int(ref[5:7])
-            meses = {
-                1: "JAN", 2: "FEV", 3: "MAR", 4: "ABR", 5: "MAI", 6: "JUN",
-                7: "JUL", 8: "AGO", 9: "SET", 10: "OUT", 11: "NOV", 12: "DEZ",
-            }
-            return f"{meses.get(month, ref[5:7])}/{year}"
+            return f"{_MONTHS_NUM_TO_PT_BR.get(month, ref[5:7])}/{year}"
         except Exception:
             return ref
     return ref
+
+
+def _normalize_month_reference_iso_loose(value) -> str:
+    """
+    Normaliza mês de referência para ISO (AAAA-MM), aceitando variações
+    legadas como:
+      - AAAA-MM
+      - AAAA/MM
+      - MM/AAAA
+      - MMM/AAAA (PT-BR)
+      - MMM-AAAA (PT-BR)
+      - AAAAMM
+    """
+    txt = _safe_str(value, "").strip().upper()
+    if not txt:
+        return ""
+    txt = re.sub(r"\s+", "", txt)
+
+    m = re.match(r"^(\d{4})[-/.](\d{1,2})$", txt)
+    if m:
+        year = _safe_int(m.group(1), 0)
+        month = _safe_int(m.group(2), 0)
+        if 1900 <= year <= 2999 and 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+
+    m = re.match(r"^(\d{1,2})[-/.](\d{4})$", txt)
+    if m:
+        month = _safe_int(m.group(1), 0)
+        year = _safe_int(m.group(2), 0)
+        if 1900 <= year <= 2999 and 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+
+    m = re.match(r"^([A-Z]{3})[-/.](\d{4})$", txt)
+    if m:
+        mon = str(m.group(1) or "").strip().upper()
+        year = _safe_int(m.group(2), 0)
+        month = int(_MONTHS_PT_BR_TO_NUM.get(mon, 0) or 0)
+        if 1900 <= year <= 2999 and 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+
+    m = re.match(r"^(\d{4})(\d{2})$", txt)
+    if m:
+        year = _safe_int(m.group(1), 0)
+        month = _safe_int(m.group(2), 0)
+        if 1900 <= year <= 2999 and 1 <= month <= 12:
+            return f"{year:04d}-{month:02d}"
+
+    return ""
+
+
+def _month_reference_candidates(mes_ref: str | None = None) -> list[str]:
+    target = _normalize_month_reference_iso_loose(mes_ref or _current_month_ref()) or _current_month_ref()
+    if len(target) != 7 or target[4] != "-":
+        return [target]
+    year = _safe_int(target[:4], 0)
+    month = _safe_int(target[5:7], 0)
+    if year <= 0 or month <= 0:
+        return [target]
+    mon_pt = str(_MONTHS_NUM_TO_PT_BR.get(month, "") or "").strip().upper()
+    mm = f"{int(month):02d}"
+    cands = {
+        target,
+        f"{year:04d}/{mm}",
+        f"{mm}/{year:04d}",
+        f"{year:04d}{mm}",
+    }
+    if mon_pt:
+        cands.add(f"{mon_pt}/{year:04d}")
+        cands.add(f"{mon_pt}-{year:04d}")
+    return sorted({str(v or "").strip() for v in cands if str(v or "").strip()})
+
+
+def cliente_ids_pagamento_mes_cursor(cur, mes_ref: str | None = None) -> set[int]:
+    candidates = _month_reference_candidates(mes_ref)
+    if not candidates:
+        return set()
+    cands_norm = sorted({str(c).strip().upper() for c in candidates if str(c).strip()})
+    placeholders = ", ".join("?" for _ in cands_norm)
+    cur.execute(
+        f"""
+        SELECT DISTINCT cliente_id
+        FROM pagamentos
+        WHERE cliente_id IS NOT NULL
+          AND UPPER(TRIM(COALESCE(mes_referencia, ''))) IN ({placeholders})
+        """,
+        tuple(cands_norm),
+    )
+    return {
+        int(r[0])
+        for r in (cur.fetchall() or [])
+        if r and _safe_int(r[0], 0) > 0
+    }
+
+
+def empresa_ids_pagamento_mes_cursor(cur, mes_ref: str | None = None) -> set[int]:
+    candidates = _month_reference_candidates(mes_ref)
+    if not candidates:
+        return set()
+    cands_norm = sorted({str(c).strip().upper() for c in candidates if str(c).strip()})
+    placeholders = ", ".join("?" for _ in cands_norm)
+    cur.execute(
+        f"""
+        SELECT DISTINCT empresa_id
+        FROM pagamentos_empresas
+        WHERE empresa_id IS NOT NULL
+          AND UPPER(TRIM(COALESCE(mes_referencia, ''))) IN ({placeholders})
+        """,
+        tuple(cands_norm),
+    )
+    return {
+        int(r[0])
+        for r in (cur.fetchall() or [])
+        if r and _safe_int(r[0], 0) > 0
+    }
+
+
+def _normalizar_mes_referencia_tabela_cursor(
+    cur,
+    *,
+    tabela: str,
+    id_pagador_col: str,
+    dry_run: bool = False,
+) -> dict:
+    cur.execute(
+        f"""
+        SELECT id, {id_pagador_col}, mes_referencia
+        FROM {tabela}
+        ORDER BY id
+        """
+    )
+    rows = cur.fetchall() or []
+
+    groups: dict[tuple[int, str], list[tuple[int, int, str]]] = {}
+    invalidos = 0
+    sem_pagador = 0
+
+    for raw in rows:
+        if not raw:
+            continue
+        row_id = _safe_int(raw[0], 0)
+        pagador_id = _safe_int(raw[1], 0)
+        mes_raw = _safe_str(raw[2], "").strip()
+        mes_iso = _normalize_month_reference_iso_loose(mes_raw)
+        if row_id <= 0:
+            continue
+        if pagador_id <= 0:
+            sem_pagador += 1
+            continue
+        if not mes_iso:
+            invalidos += 1
+            continue
+        key = (int(pagador_id), str(mes_iso))
+        groups.setdefault(key, []).append((int(row_id), int(pagador_id), mes_raw))
+
+    updates: list[tuple[str, int]] = []
+    deletes: list[tuple[int]] = []
+
+    for (pagador_id, mes_iso), items in groups.items():
+        if not items:
+            continue
+        # Em caso de duplicidade lógica (ex.: JAN/2026 + 2026-01), mantém o
+        # lançamento mais recente (maior id) e remove os demais.
+        items_sorted = sorted(items, key=lambda x: int(x[0]))
+        keeper = items_sorted[-1]
+        keeper_id = int(keeper[0])
+        keeper_mes = _safe_str(keeper[2], "").strip()
+        if keeper_mes != mes_iso:
+            updates.append((str(mes_iso), keeper_id))
+
+        for row_id, _pid, _mes_raw in items_sorted[:-1]:
+            deletes.append((int(row_id),))
+
+    if not dry_run:
+        if deletes:
+            cur.executemany(
+                f"""
+                DELETE FROM {tabela}
+                WHERE id = ?
+                """,
+                deletes,
+            )
+        if updates:
+            cur.executemany(
+                f"""
+                UPDATE {tabela}
+                SET mes_referencia = ?
+                WHERE id = ?
+                """,
+                updates,
+            )
+
+    return {
+        "tabela": str(tabela),
+        "lidos": int(len(rows)),
+        "atualizados": int(len(updates)),
+        "removidos_duplicados": int(len(deletes)),
+        "invalidos": int(invalidos),
+        "sem_pagador": int(sem_pagador),
+        "dry_run": bool(dry_run),
+    }
+
+
+def _normalizar_mes_referencia_pagamentos_cursor(cur, *, dry_run: bool = False) -> dict:
+    pagamentos = _normalizar_mes_referencia_tabela_cursor(
+        cur,
+        tabela="pagamentos",
+        id_pagador_col="cliente_id",
+        dry_run=bool(dry_run),
+    )
+    pagamentos_empresas = _normalizar_mes_referencia_tabela_cursor(
+        cur,
+        tabela="pagamentos_empresas",
+        id_pagador_col="empresa_id",
+        dry_run=bool(dry_run),
+    )
+
+    total_updates = int(pagamentos.get("atualizados", 0) or 0) + int(
+        pagamentos_empresas.get("atualizados", 0) or 0
+    )
+    total_deletes = int(pagamentos.get("removidos_duplicados", 0) or 0) + int(
+        pagamentos_empresas.get("removidos_duplicados", 0) or 0
+    )
+    total_changes = int(total_updates + total_deletes)
+
+    return {
+        "ok": True,
+        "dry_run": bool(dry_run),
+        "pagamentos": pagamentos,
+        "pagamentos_empresas": pagamentos_empresas,
+        "total_alteracoes": int(total_changes),
+    }
+
+
+def normalizar_mes_referencia_pagamentos(*, dry_run: bool = False) -> dict:
+    """
+    Normaliza `mes_referencia` em pagamentos e pagamentos_empresas para ISO
+    (`YYYY-MM`) e remove duplicidades lógicas por (pagador, mês).
+    """
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        out = _normalizar_mes_referencia_pagamentos_cursor(cur, dry_run=bool(dry_run))
+        total_changes = int(out.get("total_alteracoes", 0) or 0)
+
+        if not bool(dry_run) and total_changes > 0:
+            conn.commit()
+
+        return out
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "dry_run": bool(dry_run),
+            "erro": _safe_str(e),
+            "pagamentos": {},
+            "pagamentos_empresas": {},
+            "total_alteracoes": 0,
+        }
+    finally:
+        conn.close()
+
+
+_AUTO_MONTH_REF_NORMALIZE_LAST_RUN_KEY = "auto_month_ref_normalize_last_run"
+_AUTO_MONTH_REF_NORMALIZE_LOCK = threading.Lock()
+
+
+def _get_meta_value_cursor(cur, key: str, default: str = "") -> str:
+    _ensure_meta_table(cur)
+    cur.execute(
+        """
+        SELECT value
+        FROM medcontract_meta
+        WHERE key = ?
+        LIMIT 1
+        """,
+        (str(key or "").strip(),),
+    )
+    row = cur.fetchone()
+    if not row:
+        return _safe_str(default, "")
+    return _safe_str(row[0], default)
+
+
+def _set_meta_value_cursor(cur, key: str, value: str) -> None:
+    _ensure_meta_table(cur)
+    cur.execute(
+        """
+        INSERT INTO medcontract_meta (key, value)
+        VALUES (?, ?)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        """,
+        (str(key or "").strip(), _safe_str(value, "")),
+    )
+
+
+def normalizar_mes_referencia_pagamentos_startup(*, force: bool = False) -> dict:
+    """
+    Executa a normalização de mês de referência no startup, no máximo 1x por dia.
+    """
+    day_key = _today_iso()
+
+    with _AUTO_MONTH_REF_NORMALIZE_LOCK:
+        conn = connect()
+        try:
+            cur = conn.cursor()
+            last_run = _safe_str(
+                _get_meta_value_cursor(cur, _AUTO_MONTH_REF_NORMALIZE_LAST_RUN_KEY, ""),
+                "",
+            ).strip()
+
+            if not bool(force) and last_run == day_key:
+                return {
+                    "ok": True,
+                    "executed": False,
+                    "reason": "already_ran_today",
+                    "day_key": day_key,
+                    "last_run": last_run,
+                    "total_alteracoes": 0,
+                }
+
+            out = _normalizar_mes_referencia_pagamentos_cursor(cur, dry_run=False)
+            _set_meta_value_cursor(cur, _AUTO_MONTH_REF_NORMALIZE_LAST_RUN_KEY, day_key)
+            conn.commit()
+
+            return {
+                "ok": True,
+                "executed": True,
+                "reason": "forced" if bool(force) else "scheduled",
+                "day_key": day_key,
+                "last_run": last_run,
+                "total_alteracoes": int(out.get("total_alteracoes", 0) or 0),
+                "result": out,
+            }
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "executed": False,
+                "reason": "error",
+                "day_key": day_key,
+                "erro": _safe_str(e),
+                "total_alteracoes": 0,
+            }
+        finally:
+            conn.close()
 
 
 def _normalize_conta_status(value: str, default: str = "Pendente") -> str:
@@ -2779,6 +3349,9 @@ def listar_clientes():
     conn = connect()
     try:
         cursor = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cursor)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
         cursor.execute("SELECT * FROM clientes ORDER BY LOWER(nome), id")
         return cursor.fetchall()
     finally:
@@ -2790,6 +3363,9 @@ def listar_clientes_com_ultimo_pagamento(limit=50, offset=0, search="",
     conn = connect()
     try:
         cursor = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cursor)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
         where_sql, params = _build_clientes_where_clause(
             search=search,
             status=status,
@@ -2845,6 +3421,9 @@ def listar_clientes_export_ultimo_pagamento(
     conn = connect()
     try:
         cursor = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cursor)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
         where = []
         params = []
 
@@ -2889,6 +3468,9 @@ def contar_clientes(search="", status="", pagamento=""):
     conn = connect()
     try:
         cursor = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cursor)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
         where_sql, params = _build_clientes_where_clause(
             search=search,
             status=status,
@@ -2906,6 +3488,9 @@ def buscar_cliente_por_id(cliente_id):
     conn = connect()
     try:
         cursor = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cursor)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
         # Retorna colunas explícitas em ordem estável para evitar quebra por
         # mudanças de schema (ex.: adição de cpf_norm).
         cursor.execute("""
@@ -2930,6 +3515,9 @@ def buscar_cliente_por_cpf(cpf):
         if not cpf_raw and not cpf_norm:
             return None
         cursor = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cursor)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
         cursor.execute("""
             SELECT id, nome, status, pagamento_status
             FROM clientes
@@ -2953,6 +3541,9 @@ def buscar_cliente_preview_por_cpf(cpf: str) -> dict | None:
     conn = connect()
     try:
         cur = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cur)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
 
         cur.execute("""
             SELECT
@@ -3370,6 +3961,140 @@ def cancelar_plano_cliente(cliente_id):
         conn.close()
 
 
+def renovar_contrato_cliente(cliente_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cid = int(cliente_id)
+
+        cursor.execute(
+            """
+            SELECT nome, status, data_inicio, pagamento_status
+            FROM clientes
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (cid,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False, "Cliente nao encontrado.", {}
+
+        nome = _safe_str(row[0], "").strip() or f"MAT {cid}"
+        status_anterior = _safe_str(row[1], "ativo").strip().lower() or "ativo"
+        data_inicio_anterior = _safe_date_iso(row[2]) or _safe_str(row[2], "").strip()
+        pagamento_status = _safe_str(row[3], "em_dia").strip().lower()
+        if pagamento_status not in {"em_dia", "atrasado"}:
+            pagamento_status = "em_dia"
+
+        hoje = _today_iso()
+        cursor.execute(
+            """
+            UPDATE clientes
+            SET status = 'ativo',
+                data_inicio = ?,
+                pagamento_status = ?
+            WHERE id = ?
+            """,
+            (hoje, pagamento_status, cid),
+        )
+
+        conn.commit()
+        info = {
+            "cliente_id": int(cid),
+            "nome": nome,
+            "status_anterior": status_anterior,
+            "status_novo": "ativo",
+            "data_inicio_anterior": data_inicio_anterior,
+            "data_inicio_nova": hoje,
+        }
+
+        if status_anterior == "ativo" and data_inicio_anterior == hoje:
+            return True, "Contrato ja estava renovado hoje.", info
+        return True, "Contrato renovado com sucesso.", info
+    except Exception as e:
+        print("Erro ao renovar contrato do cliente:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, "Erro ao renovar contrato.", {}
+    finally:
+        conn.close()
+
+
+def renovar_contratos_clientes(cliente_ids):
+    conn = connect()
+    try:
+        ids = _normalize_cliente_ids(cliente_ids)
+        if not ids:
+            return False, "Selecione ao menos um cliente para renovar.", {
+                "clientes_solicitados": 0,
+                "clientes_atualizados": 0,
+            }
+
+        cursor = conn.cursor()
+        placeholders = ",".join(["?"] * len(ids))
+        cursor.execute(
+            f"""
+            SELECT id, nome, status, data_inicio
+            FROM clientes
+            WHERE id IN ({placeholders})
+            """,
+            tuple(ids),
+        )
+        rows = cursor.fetchall() or []
+        if not rows:
+            return False, "Nenhum cliente encontrado para renovacao.", {
+                "clientes_solicitados": len(ids),
+                "clientes_atualizados": 0,
+            }
+
+        hoje = _today_iso()
+        updates = [(hoje, int(r[0])) for r in rows]
+        cursor.executemany(
+            """
+            UPDATE clientes
+            SET status = 'ativo',
+                data_inicio = ?,
+                pagamento_status = CASE
+                    WHEN pagamento_status IN ('em_dia', 'atrasado') THEN pagamento_status
+                    ELSE 'em_dia'
+                END
+            WHERE id = ?
+            """,
+            updates,
+        )
+        conn.commit()
+
+        clientes_atualizados = len(rows)
+        nomes = [
+            _safe_str(r[1], "").strip()
+            for r in rows
+            if _safe_str(r[1], "").strip()
+        ]
+        info = {
+            "clientes_solicitados": len(ids),
+            "clientes_atualizados": int(clientes_atualizados),
+            "data_inicio_nova": hoje,
+            "cliente_ids": [int(r[0]) for r in rows],
+            "cliente_nomes_preview": nomes[:5],
+        }
+        return True, f"Renovacao concluida para {clientes_atualizados} cliente(s).", info
+    except Exception as e:
+        print("Erro ao renovar contratos em lote:", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False, "Erro ao renovar contratos em lote.", {
+            "clientes_solicitados": len(_normalize_cliente_ids(cliente_ids)),
+            "clientes_atualizados": 0,
+        }
+    finally:
+        conn.close()
+
+
 def excluir_cliente(cliente_id):
     conn = connect()
     try:
@@ -3734,12 +4459,24 @@ def buscar_empresa_preview_por_cnpj(cnpj: str) -> dict | None:
             return None
 
         empresa_id = int(row[0])
+        today = datetime.now().date()
+        mes_ref = today.strftime("%Y-%m")
+        pagas_mes = empresa_ids_pagamento_mes_cursor(cur, mes_ref)
+        pagamento_mes = empresa_id in pagas_mes
+        status_calc = calcular_status_pagamento(
+            {
+                "dia_vencimento": _safe_int(row[5], 10),
+                "pagamento_mes_atual": pagamento_mes,
+            },
+            hoje=today,
+        )
+
         preview = {
             "id": empresa_id,
             "nome": row[1],
             "cnpj": row[2],
             "forma_pagamento": row[3],
-            "status_pagamento": row[4],
+            "status_pagamento": status_calc,
             "dia_vencimento": _safe_int(row[5], 0),
             "valor_mensal": _safe_money_float(row[6], 0.0),
             "ultimo_pagamento": None,
@@ -3791,6 +4528,64 @@ def buscar_empresas_por_nome(nome: str, limit: int = 20):
         conn.close()
 
 
+def _normalize_empresa_status_filter(value: str) -> str:
+    txt = _safe_str(value, "").strip().lower()
+    if txt == "inadimplente":
+        return "em_atraso"
+    return txt if txt in {"em_dia", "pendente", "em_atraso"} else ""
+
+
+def _build_empresas_rows_with_dynamic_status_cursor(
+    cur,
+    *,
+    search: str = "",
+    forma_pagamento: str = "",
+) -> list[tuple]:
+    where_sql, params = _build_empresas_where_clause(
+        search=search,
+        forma_pagamento=forma_pagamento,
+        status_pagamento="",
+        table_alias="e",
+    )
+
+    cur.execute(
+        f"""
+        SELECT
+            e.id, e.cnpj, e.nome, e.telefone, e.email,
+            e.logradouro, e.numero, e.bairro, e.cep, e.cidade, e.estado,
+            e.forma_pagamento, e.status_pagamento, e.dia_vencimento,
+            e.valor_mensal, e.data_cadastro
+        FROM empresas e
+        {where_sql}
+        ORDER BY LOWER(e.nome), e.id
+        """,
+        tuple(params),
+    )
+    rows = cur.fetchall() or []
+    if not rows:
+        return []
+
+    today = datetime.now().date()
+    mes_ref = today.strftime("%Y-%m")
+    pagas_mes = empresa_ids_pagamento_mes_cursor(cur, mes_ref)
+
+    out: list[tuple] = []
+    for row in rows:
+        row_list = list(row)
+        empresa_id = _safe_int(row_list[0], 0)
+        dia_venc = _safe_int(row_list[13], 10)
+        status_calc = calcular_status_pagamento(
+            {
+                "dia_vencimento": dia_venc,
+                "pagamento_mes_atual": empresa_id in pagas_mes,
+            },
+            hoje=today,
+        )
+        row_list[12] = status_calc
+        out.append(tuple(row_list))
+    return out
+
+
 def listar_empresas_payload(page=0, limit=50, search="", forma_pagamento="", status_pagamento="") -> dict:
     page_size = max(1, _safe_int(limit, 50))
     requested_page = max(0, _safe_int(page, 0))
@@ -3798,59 +4593,30 @@ def listar_empresas_payload(page=0, limit=50, search="", forma_pagamento="", sta
     conn = connect()
     try:
         cur = conn.cursor()
-
-        where_rows_sql, params_rows = _build_empresas_where_clause(
+        base_rows = _build_empresas_rows_with_dynamic_status_cursor(
+            cur,
             search=search,
             forma_pagamento=forma_pagamento,
-            status_pagamento=status_pagamento,
-            table_alias="e",
-        )
-        where_status_sql, params_status = _build_empresas_where_clause(
-            search=search,
-            forma_pagamento=forma_pagamento,
-            status_pagamento="",
-            table_alias="e",
         )
 
-        query_metrics = f"""
-            WITH status_base AS (
-                SELECT e.status_pagamento
-                FROM empresas e
-                {where_status_sql}
-            )
-            SELECT
-                (SELECT COUNT(*) FROM empresas e {where_rows_sql}) AS total,
-                COALESCE(SUM(CASE WHEN status_pagamento = 'em_dia' THEN 1 ELSE 0 END), 0) AS em_dia,
-                COALESCE(SUM(CASE WHEN status_pagamento = 'pendente' THEN 1 ELSE 0 END), 0) AS pendente,
-                COALESCE(SUM(CASE WHEN status_pagamento = 'inadimplente' THEN 1 ELSE 0 END), 0) AS inadimplente
-            FROM status_base
-        """
-        cur.execute(query_metrics, tuple(params_status + params_rows))
-        metrics = cur.fetchone() or (0, 0, 0, 0)
-        total = int(metrics[0] or 0)
-        status_counts = {
-            "em_dia": int(metrics[1] or 0),
-            "pendente": int(metrics[2] or 0),
-            "inadimplente": int(metrics[3] or 0),
-        }
+        status_counts = {"em_dia": 0, "pendente": 0, "em_atraso": 0, "inadimplente": 0}
+        for row in base_rows:
+            st = _safe_str(row[12], "").strip().lower()
+            if st in {"em_dia", "pendente", "em_atraso"}:
+                status_counts[st] += 1
+        status_counts["inadimplente"] = status_counts["em_atraso"]
 
+        status_filter = _normalize_empresa_status_filter(status_pagamento)
+        if status_filter:
+            filtered_rows = [r for r in base_rows if _safe_str(r[12], "").strip().lower() == status_filter]
+        else:
+            filtered_rows = list(base_rows)
+
+        total = len(filtered_rows)
         max_page = max(0, (max(0, total) - 1) // page_size)
         page_safe = min(requested_page, max_page)
         offset = page_safe * page_size
-
-        query_rows = f"""
-            SELECT
-                e.id, e.cnpj, e.nome, e.telefone, e.email,
-                e.logradouro, e.numero, e.bairro, e.cep, e.cidade, e.estado,
-                e.forma_pagamento, e.status_pagamento, e.dia_vencimento,
-                e.valor_mensal, e.data_cadastro
-            FROM empresas e
-            {where_rows_sql}
-            ORDER BY LOWER(e.nome), e.id
-            LIMIT ? OFFSET ?
-        """
-        cur.execute(query_rows, tuple(params_rows + [page_size, offset]))
-        rows = cur.fetchall() or []
+        rows = filtered_rows[offset:offset + page_size]
 
         return {
             "total": total,
@@ -3866,25 +4632,17 @@ def listar_empresas(limit=50, offset=0, search="", forma_pagamento="", status_pa
     conn = connect()
     try:
         cur = conn.cursor()
-        where_sql, params = _build_empresas_where_clause(
+        rows = _build_empresas_rows_with_dynamic_status_cursor(
+            cur,
             search=search,
             forma_pagamento=forma_pagamento,
-            status_pagamento=status_pagamento,
-            table_alias="e",
         )
-        query = f"""
-            SELECT
-                e.id, e.cnpj, e.nome, e.telefone, e.email,
-                e.logradouro, e.numero, e.bairro, e.cep, e.cidade, e.estado,
-                e.forma_pagamento, e.status_pagamento, e.dia_vencimento,
-                e.valor_mensal, e.data_cadastro
-            FROM empresas e
-            {where_sql}
-            ORDER BY LOWER(e.nome), e.id
-            LIMIT ? OFFSET ?
-        """
-        cur.execute(query, tuple(params + [int(limit), int(offset)]))
-        return cur.fetchall()
+        status_filter = _normalize_empresa_status_filter(status_pagamento)
+        if status_filter:
+            rows = [r for r in rows if _safe_str(r[12], "").strip().lower() == status_filter]
+        start = max(0, _safe_int(offset, 0))
+        page_size = max(1, _safe_int(limit, 50))
+        return rows[start: start + page_size]
     finally:
         conn.close()
 
@@ -3893,16 +4651,15 @@ def contar_empresas(search="", forma_pagamento="", status_pagamento=""):
     conn = connect()
     try:
         cur = conn.cursor()
-        where_sql, params = _build_empresas_where_clause(
+        rows = _build_empresas_rows_with_dynamic_status_cursor(
+            cur,
             search=search,
             forma_pagamento=forma_pagamento,
-            status_pagamento=status_pagamento,
-            table_alias="e",
         )
-        query = f"SELECT COUNT(*) FROM empresas e {where_sql}"
-        cur.execute(query, tuple(params))
-        row = cur.fetchone()
-        return int(row[0] if row else 0)
+        status_filter = _normalize_empresa_status_filter(status_pagamento)
+        if status_filter:
+            return len([r for r in rows if _safe_str(r[12], "").strip().lower() == status_filter])
+        return len(rows)
     finally:
         conn.close()
 
@@ -3915,25 +4672,17 @@ def contar_empresas_por_status(search="", forma_pagamento="") -> dict:
     conn = connect()
     try:
         cur = conn.cursor()
-        where_sql, params = _build_empresas_where_clause(
+        rows = _build_empresas_rows_with_dynamic_status_cursor(
+            cur,
             search=search,
             forma_pagamento=forma_pagamento,
-            status_pagamento="",
-            table_alias="e",
         )
-        query = f"""
-            SELECT e.status_pagamento, COUNT(*)
-            FROM empresas e
-            {where_sql}
-            GROUP BY e.status_pagamento
-        """
-        cur.execute(query, tuple(params))
-
-        counts = {"em_dia": 0, "pendente": 0, "inadimplente": 0}
-        for row in cur.fetchall() or []:
-            key = _safe_str(row[0], "").strip().lower()
-            if key in counts:
-                counts[key] = int(row[1] or 0)
+        counts = {"em_dia": 0, "pendente": 0, "em_atraso": 0, "inadimplente": 0}
+        for row in rows:
+            key = _safe_str(row[12], "").strip().lower()
+            if key in {"em_dia", "pendente", "em_atraso"}:
+                counts[key] += 1
+        counts["inadimplente"] = counts["em_atraso"]
         return counts
     finally:
         conn.close()
@@ -4329,6 +5078,9 @@ def listar_financeiro_detalhado_payload(
     conn = connect()
     try:
         cur = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cur)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
         cur.execute(
             f"""
             SELECT COUNT(*), COALESCE(SUM(p.valor_pago), 0)
@@ -4410,6 +5162,9 @@ def carregar_financeiro_mes(mes_iso: str, detail_limit: int = 500) -> dict:
     conn = connect()
     try:
         cur = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cur)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
 
         cur.execute(
             """
@@ -4548,6 +5303,24 @@ def _conta_row_to_dict(row) -> dict:
     }
 
 
+def _month_date_bounds(mes_iso: str) -> tuple[str, str]:
+    ref = _safe_str(mes_iso).strip()
+    if len(ref) != 7 or ref[4] != "-":
+        ref = _current_month_ref()
+    try:
+        year = int(ref[:4])
+        month = int(ref[5:7])
+    except Exception:
+        year = datetime.now().year
+        month = datetime.now().month
+    start = f"{year:04d}-{month:02d}-01"
+    if month == 12:
+        end = f"{year + 1:04d}-01-01"
+    else:
+        end = f"{year:04d}-{month + 1:02d}-01"
+    return start, end
+
+
 def _load_contas_pagar_rows() -> list[dict]:
     conn = connect()
     try:
@@ -4567,6 +5340,40 @@ def _load_contas_pagar_rows() -> list[dict]:
             if item["status"] == "Pendente":
                 venc = _safe_date_iso(item.get("data_vencimento"))
                 if venc and venc < _today_iso():
+                    item["status"] = "Vencida"
+        return out
+    finally:
+        conn.close()
+
+
+def _load_contas_pagar_rows_by_month(mes_iso: str) -> list[dict]:
+    ref = _safe_str(mes_iso).strip()
+    if len(ref) != 7 or ref[4] != "-":
+        ref = _current_month_ref()
+    start_iso, end_iso = _month_date_bounds(ref)
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                id, descricao, categoria, fornecedor, valor_previsto,
+                data_vencimento, data_competencia, forma_pagamento, status,
+                recorrente, periodicidade, parcela_atual, total_parcelas,
+                data_pagamento_real, valor_pago, observacoes, criado_em, atualizado_em
+            FROM contas_pagar
+            WHERE data_vencimento >= ? AND data_vencimento < ?
+            ORDER BY data_vencimento DESC, id DESC
+            """,
+            (start_iso, end_iso),
+        )
+        rows = cur.fetchall() or []
+        out = [_conta_row_to_dict(row) for row in rows]
+        today = _today_iso()
+        for item in out:
+            if item["status"] == "Pendente":
+                venc = _safe_date_iso(item.get("data_vencimento"))
+                if venc and venc < today:
                     item["status"] = "Vencida"
         return out
     finally:
@@ -4651,7 +5458,13 @@ def carregar_contas_pagar_mes(mes_iso: str, detail_limit: int = 500) -> dict:
     if len(ref) != 7 or ref[4] != "-":
         ref = _current_month_ref()
 
-    rows = _load_contas_pagar_rows()
+    today = _today_iso()
+    try:
+        today_dt = datetime.strptime(today, "%Y-%m-%d").date()
+    except Exception:
+        today_dt = datetime.now().date()
+
+    rows = _load_contas_pagar_rows_by_month(ref)
     filtered = [r for r in rows if _safe_date_iso(r.get("data_vencimento"))[:7] == ref]
 
     total = len(filtered)
@@ -4741,7 +5554,7 @@ def listar_contas_pagar_detalhado_payload(
     requested_page = max(0, _safe_int(page, 0))
 
     rows = _filter_contas_pagar_rows(
-        _load_contas_pagar_rows(),
+        _load_contas_pagar_rows_by_month(ref),
         mes_iso=ref,
         search=search,
         status=status,
@@ -4789,6 +5602,46 @@ def listar_contas_pagar_detalhado_payload(
 
 
 def _insert_conta_pagar_row(cursor, payload: dict) -> int:
+    params = (
+        _safe_str(payload.get("descricao"), "").strip(),
+        _normalize_conta_categoria(payload.get("categoria")),
+        _safe_str(payload.get("fornecedor"), "").strip(),
+        float(payload.get("valor_previsto", 0.0) or 0.0),
+        _safe_date_iso(payload.get("data_vencimento")) or _today_iso(),
+        _safe_str(payload.get("data_competencia"), "").strip() or _to_conta_competencia(payload.get("data_vencimento")),
+        _normalize_conta_forma_pagamento(payload.get("forma_pagamento")),
+        _normalize_conta_status(payload.get("status"), default="Pendente"),
+        bool(payload.get("recorrente")),
+        _normalize_conta_periodicidade(payload.get("periodicidade")) or None,
+        _safe_int(payload.get("parcela_atual"), 0) or None,
+        _safe_int(payload.get("total_parcelas"), 0) or None,
+        _safe_date_iso(payload.get("data_pagamento_real")) or None,
+        _safe_float(payload.get("valor_pago"), 0.0) if payload.get("valor_pago") is not None else None,
+        _safe_str(payload.get("observacoes"), "").strip() or None,
+        _safe_str(payload.get("criado_em"), "").strip() or datetime.now().isoformat(timespec="seconds"),
+        _safe_str(payload.get("atualizado_em"), "").strip() or datetime.now().isoformat(timespec="seconds"),
+    )
+    backend = str(getattr(cursor, "_backend", "sqlite") or "sqlite").strip().lower()
+    if backend == "postgres":
+        cursor.execute(
+            """
+            INSERT INTO contas_pagar (
+                descricao, categoria, fornecedor, valor_previsto, data_vencimento,
+                data_competencia, forma_pagamento, status, recorrente, periodicidade,
+                parcela_atual, total_parcelas, data_pagamento_real, valor_pago,
+                observacoes, criado_em, atualizado_em
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            RETURNING id
+            """,
+            params,
+        )
+        row = cursor.fetchone()
+        try:
+            return int(row[0] if row else 0)
+        except Exception:
+            return 0
+
     cursor.execute(
         """
         INSERT INTO contas_pagar (
@@ -4799,25 +5652,7 @@ def _insert_conta_pagar_row(cursor, payload: dict) -> int:
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (
-            _safe_str(payload.get("descricao"), "").strip(),
-            _normalize_conta_categoria(payload.get("categoria")),
-            _safe_str(payload.get("fornecedor"), "").strip(),
-            float(payload.get("valor_previsto", 0.0) or 0.0),
-            _safe_date_iso(payload.get("data_vencimento")) or _today_iso(),
-            _safe_str(payload.get("data_competencia"), "").strip() or _to_conta_competencia(payload.get("data_vencimento")),
-            _normalize_conta_forma_pagamento(payload.get("forma_pagamento")),
-            _normalize_conta_status(payload.get("status"), default="Pendente"),
-            1 if bool(payload.get("recorrente")) else 0,
-            _normalize_conta_periodicidade(payload.get("periodicidade")) or None,
-            _safe_int(payload.get("parcela_atual"), 0) or None,
-            _safe_int(payload.get("total_parcelas"), 0) or None,
-            _safe_date_iso(payload.get("data_pagamento_real")) or None,
-            _safe_float(payload.get("valor_pago"), 0.0) if payload.get("valor_pago") is not None else None,
-            _safe_str(payload.get("observacoes"), "").strip() or None,
-            _safe_str(payload.get("criado_em"), "").strip() or datetime.now().isoformat(timespec="seconds"),
-            _safe_str(payload.get("atualizado_em"), "").strip() or datetime.now().isoformat(timespec="seconds"),
-        ),
+        params,
     )
     try:
         return int(getattr(cursor, "lastrowid", 0) or 0)
@@ -4981,7 +5816,7 @@ def atualizar_conta_pagar(conta_id: int, payload: dict) -> tuple[bool, str, dict
                 merged["data_competencia"],
                 merged["forma_pagamento"],
                 merged["status"],
-                1 if bool(merged.get("recorrente")) else 0,
+                bool(merged.get("recorrente")),
                 merged["periodicidade"],
                 merged["parcela_atual"],
                 merged["total_parcelas"],
@@ -5013,9 +5848,10 @@ def marcar_conta_paga(conta_id: int, data_pagamento_real: str | None = None, val
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT id, descricao, valor_previsto, data_vencimento, data_competencia,
-                   forma_pagamento, status, recorrente, periodicidade, parcela_atual,
-                   total_parcelas, observacoes
+            SELECT
+                id, descricao, categoria, fornecedor, valor_previsto,
+                data_vencimento, data_competencia, forma_pagamento, status,
+                recorrente, periodicidade, parcela_atual, total_parcelas, observacoes
             FROM contas_pagar
             WHERE id = ?
             LIMIT 1
@@ -5025,8 +5861,33 @@ def marcar_conta_paga(conta_id: int, data_pagamento_real: str | None = None, val
         row = cur.fetchone()
         if not row:
             return False, "Conta não encontrada.", {}
+
+        conta = _conta_row_to_dict(
+            (
+                row[0],  # id
+                row[1],  # descricao
+                row[2],  # categoria
+                row[3],  # fornecedor
+                row[4],  # valor_previsto
+                row[5],  # data_vencimento
+                row[6],  # data_competencia
+                row[7],  # forma_pagamento
+                row[8],  # status
+                row[9],  # recorrente
+                row[10], # periodicidade
+                row[11], # parcela_atual
+                row[12], # total_parcelas
+                None,    # data_pagamento_real
+                None,    # valor_pago
+                row[13], # observacoes
+                "",      # criado_em
+                "",      # atualizado_em
+            )
+        )
+
         pago = _safe_date_iso(data_pagamento_real) or _today_iso()
-        valor = _safe_float(valor_pago, _safe_float(row[2], 0.0))
+        valor = _safe_float(valor_pago, _safe_float(conta.get("valor_previsto"), 0.0))
+        now_iso = datetime.now().isoformat(timespec="seconds")
         cur.execute(
             """
             UPDATE contas_pagar
@@ -5036,10 +5897,90 @@ def marcar_conta_paga(conta_id: int, data_pagamento_real: str | None = None, val
                 atualizado_em = ?
             WHERE id = ?
             """,
-            (pago, valor, datetime.now().isoformat(timespec="seconds"), cid),
+            (pago, valor, now_iso, cid),
         )
+
+        proxima_conta_id = 0
+        recorrente = bool(conta.get("recorrente"))
+        periodicidade = _normalize_conta_periodicidade(conta.get("periodicidade"))
+        months_step = _periodicidade_to_months(periodicidade) if recorrente else 0
+        parcela_atual = _safe_int(conta.get("parcela_atual"), 0) if conta.get("parcela_atual") is not None else None
+        total_parcelas = _safe_int(conta.get("total_parcelas"), 0) if conta.get("total_parcelas") is not None else None
+        has_more_parcelas = True
+        if total_parcelas is not None and total_parcelas > 0 and parcela_atual is not None:
+            has_more_parcelas = parcela_atual < total_parcelas
+
+        if recorrente and months_step > 0 and has_more_parcelas:
+            venc_atual = _safe_date_iso(conta.get("data_vencimento")) or _today_iso()
+            prox_venc = _add_months_to_date(venc_atual, months_step)
+            prox_parcela = None
+            if parcela_atual is not None and parcela_atual > 0:
+                prox_parcela = int(parcela_atual + 1)
+            if total_parcelas is not None and total_parcelas > 0 and prox_parcela is not None and prox_parcela > total_parcelas:
+                prox_parcela = total_parcelas
+
+            cur.execute(
+                """
+                SELECT id
+                FROM contas_pagar
+                WHERE COALESCE(descricao, '') = ?
+                  AND COALESCE(categoria, '') = ?
+                  AND COALESCE(fornecedor, '') = ?
+                  AND COALESCE(valor_previsto, 0) = ?
+                  AND COALESCE(data_vencimento, '') = ?
+                  AND (
+                        (? IS NULL AND parcela_atual IS NULL)
+                        OR parcela_atual = ?
+                  )
+                LIMIT 1
+                """,
+                (
+                    _safe_str(conta.get("descricao"), "").strip(),
+                    _safe_str(conta.get("categoria"), "").strip(),
+                    _safe_str(conta.get("fornecedor"), "").strip(),
+                    _safe_float(conta.get("valor_previsto"), 0.0),
+                    prox_venc,
+                    prox_parcela,
+                    prox_parcela,
+                ),
+            )
+            dup = cur.fetchone()
+            if not dup:
+                cur.execute(
+                    """
+                    INSERT INTO contas_pagar (
+                        descricao, categoria, fornecedor, valor_previsto, data_vencimento,
+                        data_competencia, forma_pagamento, status, recorrente, periodicidade,
+                        parcela_atual, total_parcelas, data_pagamento_real, valor_pago,
+                        observacoes, criado_em, atualizado_em
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'Pendente', ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+                    """,
+                    (
+                        _safe_str(conta.get("descricao"), "").strip(),
+                        _safe_str(conta.get("categoria"), "").strip(),
+                        _safe_str(conta.get("fornecedor"), "").strip(),
+                        _safe_float(conta.get("valor_previsto"), 0.0),
+                        prox_venc,
+                        _to_conta_competencia(prox_venc),
+                        _safe_str(conta.get("forma_pagamento"), "").strip(),
+                        1 if recorrente else 0,
+                        periodicidade or None,
+                        prox_parcela,
+                        total_parcelas if (total_parcelas is not None and total_parcelas > 0) else None,
+                        _safe_str(conta.get("observacoes"), "").strip() or None,
+                        now_iso,
+                        now_iso,
+                    ),
+                )
+                proxima_conta_id = _safe_int(getattr(cur, "lastrowid", 0), 0)
         conn.commit()
-        return True, "Conta marcada como paga.", {"id": cid, "data_pagamento_real": pago, "valor_pago": valor}
+        return True, "Conta marcada como paga.", {
+            "id": cid,
+            "data_pagamento_real": pago,
+            "valor_pago": valor,
+            "proxima_conta_id": int(proxima_conta_id or 0),
+        }
     except Exception as e:
         try:
             conn.rollback()
@@ -5072,6 +6013,387 @@ def excluir_conta_pagar(conta_id: int) -> tuple[bool, str]:
         conn.close()
 
 
+_CONTAS_ALERTA_DIAS_META_KEY = "contas_alerta_dias_v1"
+_CONTAS_ALERTA_DIAS_USER_META_PREFIX = "contas_alerta_dias_user_v1:"
+_FINANCEIRO_PREFS_META_PREFIX = "financeiro_prefs_v1:"
+_USER_APP_PREFS_META_PREFIX = "user_app_prefs_v1:"
+
+
+def _normalize_meta_user_slug(value: str | None) -> str:
+    raw = _safe_str(value, "").strip().lower()
+    if not raw:
+        return ""
+    out: list[str] = []
+    for ch in raw:
+        if ch.isalnum():
+            out.append(ch)
+        elif ch in {"@", ".", "-", "_", ":"}:
+            out.append("_")
+    slug = "".join(out).strip("_")
+    return slug[:80]
+
+
+def _contas_alerta_meta_key(usuario: str | None = None) -> str:
+    slug = _normalize_meta_user_slug(usuario)
+    if not slug:
+        return _CONTAS_ALERTA_DIAS_META_KEY
+    return f"{_CONTAS_ALERTA_DIAS_USER_META_PREFIX}{slug}"
+
+
+def _normalize_contas_alerta_days(value) -> list[int]:
+    raw_items: list[int] = []
+    if isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        txt = _safe_str(value, "").strip()
+        items = [p.strip() for p in txt.split(",")] if txt else []
+    for item in items:
+        try:
+            day = int(str(item).strip())
+        except Exception:
+            continue
+        if 0 <= day <= 30:
+            raw_items.append(day)
+    out = sorted(set(raw_items))
+    if not out:
+        out = [0, 3, 7]
+    return out
+
+
+def obter_contas_alerta_config(usuario: str | None = None) -> dict:
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        _ensure_meta_table(cur)
+        meta_key = _contas_alerta_meta_key(usuario)
+        cur.execute(
+            """
+            SELECT value
+            FROM medcontract_meta
+            WHERE key = ?
+            LIMIT 1
+            """,
+            (meta_key,),
+        )
+        row = cur.fetchone()
+        if not row and meta_key != _CONTAS_ALERTA_DIAS_META_KEY:
+            cur.execute(
+                """
+                SELECT value
+                FROM medcontract_meta
+                WHERE key = ?
+                LIMIT 1
+                """,
+                (_CONTAS_ALERTA_DIAS_META_KEY,),
+            )
+            row = cur.fetchone()
+        days = _normalize_contas_alerta_days((row[0] if row else "") or "")
+        return {
+            "dias": list(days),
+            "janela_max": int(max(days) if days else 0),
+        }
+    except Exception:
+        return {"dias": [0, 3, 7], "janela_max": 7}
+    finally:
+        conn.close()
+
+
+def salvar_contas_alerta_config(dias, usuario: str | None = None) -> dict:
+    days = _normalize_contas_alerta_days(dias)
+    payload = ",".join(str(int(d)) for d in days)
+    meta_key = _contas_alerta_meta_key(usuario)
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        _ensure_meta_table(cur)
+        cur.execute(
+            """
+            INSERT INTO medcontract_meta (key, value)
+            VALUES (?, ?)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            (meta_key, payload),
+        )
+        conn.commit()
+        return {
+            "ok": True,
+            "dias": list(days),
+            "janela_max": int(max(days) if days else 0),
+        }
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "erro": _safe_str(e), "dias": list(days)}
+    finally:
+        conn.close()
+
+
+def resumo_alertas_contas_vencimento(
+    data_ref_iso: str | None = None,
+    dias=None,
+    usuario: str | None = None,
+) -> dict:
+    ref_iso = _safe_date_iso(data_ref_iso) or _today_iso()
+    try:
+        ref_dt = datetime.strptime(ref_iso, "%Y-%m-%d").date()
+    except Exception:
+        ref_dt = datetime.now().date()
+        ref_iso = ref_dt.strftime("%Y-%m-%d")
+
+    cfg_days = _normalize_contas_alerta_days(
+        dias if dias is not None else obter_contas_alerta_config(usuario=usuario).get("dias")
+    )
+    janela_max = int(max(cfg_days) if cfg_days else 0)
+    start_iso = (ref_dt - timedelta(days=31)).strftime("%Y-%m-%d")
+    end_iso = (ref_dt + timedelta(days=janela_max)).strftime("%Y-%m-%d")
+
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT data_vencimento, COALESCE(status, 'Pendente')
+            FROM contas_pagar
+            WHERE data_vencimento >= ? AND data_vencimento <= ?
+            """,
+            (start_iso, end_iso),
+        )
+        rows = cur.fetchall() or []
+    finally:
+        conn.close()
+
+    alertas_por_dia = {int(d): 0 for d in cfg_days}
+    vencidas = 0
+    pendentes_total = 0
+    hoje = ref_dt
+
+    for row in rows:
+        venc = _safe_date_iso(row[0] if row else "")
+        if not venc:
+            continue
+        status = _normalize_conta_status(row[1] if row else "", default="Pendente")
+        if status == "Paga":
+            continue
+        pendentes_total += 1
+        try:
+            venc_dt = datetime.strptime(venc, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        diff = int((venc_dt - hoje).days)
+        if diff < 0:
+            vencidas += 1
+            continue
+        if diff in alertas_por_dia:
+            alertas_por_dia[diff] = int(alertas_por_dia.get(diff, 0) + 1)
+
+    dentro_janela = int(sum(alertas_por_dia.values()))
+    return {
+        "data_ref": ref_iso,
+        "dias": list(cfg_days),
+        "janela_max": int(janela_max),
+        "alertas_por_dia": alertas_por_dia,
+        "vencidas": int(vencidas),
+        "pendentes_total": int(pendentes_total),
+        "dentro_janela": int(dentro_janela),
+    }
+
+
+def _normalize_financeiro_pref_query(value: dict | None) -> dict:
+    src = dict(value or {})
+    try:
+        min_value = None if src.get("min_value") in (None, "") else float(src.get("min_value"))
+    except Exception:
+        min_value = None
+    try:
+        max_value = None if src.get("max_value") in (None, "") else float(src.get("max_value"))
+    except Exception:
+        max_value = None
+    if min_value is not None and max_value is not None and min_value > max_value:
+        min_value, max_value = max_value, min_value
+    return {
+        "search_doc": str(src.get("search_doc", "") or "").strip(),
+        "search_name": str(src.get("search_name", "") or "").strip(),
+        "status_key": str(src.get("status_key", "") or "").strip().lower(),
+        "min_value": min_value,
+        "max_value": max_value,
+        "only_atrasados": bool(src.get("only_atrasados", False)),
+        "above_ticket": bool(src.get("above_ticket", False)),
+        "only_today": bool(src.get("only_today", False)),
+    }
+
+
+def _normalize_contas_pref_query(value: dict | None) -> dict:
+    src = dict(value or {})
+    return {
+        "search": str(src.get("search", "") or "").strip(),
+        "status": str(src.get("status", "") or "").strip().lower(),
+        "only_vencidas": bool(src.get("only_vencidas", False)),
+        "vencem_hoje": bool(src.get("vencem_hoje", False)),
+        "vencem_7d": bool(src.get("vencem_7d", False)),
+        "sort_key": str(src.get("sort_key", "data_vencimento") or "data_vencimento").strip(),
+        "sort_dir": str(src.get("sort_dir", "asc") or "asc").strip().lower(),
+    }
+
+
+def _normalize_financeiro_pref_payload(value: dict | None) -> dict:
+    src = dict(value or {})
+    return {
+        "financeiro_query": _normalize_financeiro_pref_query(src.get("financeiro_query") or {}),
+        "contas_query": _normalize_contas_pref_query(src.get("contas_query") or {}),
+    }
+
+
+def salvar_preferencias_financeiro_usuario(usuario: str, prefs: dict | None) -> dict:
+    user_slug = _normalize_meta_user_slug(usuario)
+    if not user_slug:
+        return {"ok": False, "erro": "usuario_invalido", "usuario": ""}
+
+    payload = _normalize_financeiro_pref_payload(prefs)
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        _set_meta_value_cursor(cur, f"{_FINANCEIRO_PREFS_META_PREFIX}{user_slug}", raw)
+        conn.commit()
+        return {"ok": True, "usuario": user_slug, **payload}
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "erro": _safe_str(e), "usuario": user_slug}
+    finally:
+        conn.close()
+
+
+def obter_preferencias_financeiro_usuario(usuario: str) -> dict:
+    user_slug = _normalize_meta_user_slug(usuario)
+    if not user_slug:
+        return {"ok": True, "usuario": "", "financeiro_query": {}, "contas_query": {}}
+
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        raw = _get_meta_value_cursor(cur, f"{_FINANCEIRO_PREFS_META_PREFIX}{user_slug}", "")
+        if not str(raw or "").strip():
+            return {"ok": True, "usuario": user_slug, "financeiro_query": {}, "contas_query": {}}
+        try:
+            parsed = json.loads(str(raw))
+        except Exception:
+            parsed = {}
+        out = _normalize_financeiro_pref_payload(parsed)
+        out["ok"] = True
+        out["usuario"] = user_slug
+        return out
+    except Exception as e:
+        return {
+            "ok": False,
+            "erro": _safe_str(e),
+            "usuario": user_slug,
+            "financeiro_query": {},
+            "contas_query": {},
+        }
+    finally:
+        conn.close()
+
+
+def _default_preferencias_usuario() -> dict:
+    return {
+        "dashboard_period_default": "month",
+        "dashboard_apply_period_on_login": True,
+        "auto_refresh_interval_s": 60,
+        "finance_page_size": 50,
+        "contas_page_size": 50,
+        "layout_density": "normal",
+    }
+
+
+def _normalize_preferencias_usuario_payload(value: dict | None) -> dict:
+    src = dict(value or {})
+    out = dict(_default_preferencias_usuario())
+
+    period = str(src.get("dashboard_period_default", out["dashboard_period_default"]) or "").strip().lower()
+    if period not in {"month", "7d", "today"}:
+        period = "month"
+    out["dashboard_period_default"] = period
+    out["dashboard_apply_period_on_login"] = bool(src.get("dashboard_apply_period_on_login", True))
+
+    try:
+        refresh_s = int(src.get("auto_refresh_interval_s", out["auto_refresh_interval_s"]) or out["auto_refresh_interval_s"])
+    except Exception:
+        refresh_s = int(out["auto_refresh_interval_s"])
+    if refresh_s not in {30, 45, 60, 90, 120, 180, 300, 600}:
+        refresh_s = int(out["auto_refresh_interval_s"])
+    out["auto_refresh_interval_s"] = refresh_s
+
+    for key in ("finance_page_size", "contas_page_size"):
+        try:
+            size = int(src.get(key, out[key]) or out[key])
+        except Exception:
+            size = int(out[key])
+        if size not in {25, 50, 75, 100, 200}:
+            size = int(out[key])
+        out[key] = size
+
+    layout_density = str(src.get("layout_density", out["layout_density"]) or "").strip().lower()
+    if layout_density not in {"normal", "compact"}:
+        layout_density = "normal"
+    out["layout_density"] = layout_density
+
+    return out
+
+
+def salvar_preferencias_usuario(usuario: str, prefs: dict | None) -> dict:
+    user_slug = _normalize_meta_user_slug(usuario)
+    if not user_slug:
+        return {"ok": False, "erro": "usuario_invalido", "usuario": ""}
+
+    payload = _normalize_preferencias_usuario_payload(prefs)
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        _set_meta_value_cursor(cur, f"{_USER_APP_PREFS_META_PREFIX}{user_slug}", raw)
+        conn.commit()
+        return {"ok": True, "usuario": user_slug, **payload}
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "erro": _safe_str(e), "usuario": user_slug, **payload}
+    finally:
+        conn.close()
+
+
+def obter_preferencias_usuario(usuario: str) -> dict:
+    user_slug = _normalize_meta_user_slug(usuario)
+    defaults = _default_preferencias_usuario()
+    if not user_slug:
+        return {"ok": True, "usuario": "", **defaults}
+
+    conn = connect()
+    try:
+        cur = conn.cursor()
+        raw = _get_meta_value_cursor(cur, f"{_USER_APP_PREFS_META_PREFIX}{user_slug}", "")
+        if not str(raw or "").strip():
+            return {"ok": True, "usuario": user_slug, **defaults}
+        try:
+            parsed = json.loads(str(raw))
+        except Exception:
+            parsed = {}
+        out = _normalize_preferencias_usuario_payload(parsed)
+        out["ok"] = True
+        out["usuario"] = user_slug
+        return out
+    except Exception as e:
+        return {"ok": False, "erro": _safe_str(e), "usuario": user_slug, **defaults}
+    finally:
+        conn.close()
+
+
 # =========================
 # MÃ‰TRICAS
 # =========================
@@ -5079,6 +6401,9 @@ def metricas_clientes():
     conn = connect()
     try:
         cursor = conn.cursor()
+        sync = _sincronizar_status_pagamento_clientes_cursor(cursor)
+        if int(sync.get("atualizados", 0) or 0) > 0:
+            conn.commit()
         cursor.execute(
             """
             SELECT

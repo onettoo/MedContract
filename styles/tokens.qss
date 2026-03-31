@@ -1,0 +1,45 @@
+/* Design tokens (base shared states) */
+QToolTip {
+    background: rgba(15, 23, 42, 0.96);
+    color: #f8fafc;
+    border: 1px solid rgba(148, 163, 184, 0.42);
+    border-radius: 8px;
+    padding: 6px 8px;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+QPushButton {
+    min-height: 32px;
+}
+
+QPushButton:focus {
+    border: 1px solid rgba(43,108,126,0.78);
+}
+
+QLineEdit:focus,
+QComboBox:focus,
+QSpinBox:focus,
+QTextEdit:focus,
+QPlainTextEdit:focus {
+    border: 1px solid rgba(43,108,126,0.72);
+}
+
+QScrollBar:vertical {
+    width: 10px;
+    background: transparent;
+    margin: 2px 0 2px 0;
+}
+QScrollBar::handle:vertical {
+    background: rgba(100,116,139,0.45);
+    border-radius: 5px;
+    min-height: 18px;
+}
+QScrollBar::handle:vertical:hover {
+    background: rgba(71,85,105,0.65);
+}
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+

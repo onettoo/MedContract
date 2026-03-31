@@ -15,13 +15,12 @@ from pathlib import Path
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFrame, QStackedWidget, QGraphicsDropShadowEffect, QMessageBox, QFileDialog,
-    QDialog, QLineEdit, QDialogButtonBox, QComboBox
+    QDialog, QLineEdit, QDialogButtonBox, QComboBox, QProgressDialog
 )
 from PySide6.QtCore import Qt, QTimer, QObject, Signal, QRunnable, QThreadPool, Slot, QStandardPaths
 from PySide6.QtGui import QColor, QKeySequence, QShortcut, QGuiApplication
 
 import database.db as db
-import controllers.cliente_controller as cliente_controller
 import controllers.empresa_controller as empresa_controller
 import controllers.pagamento_controller as pagamento_controller
 from services import email_service
@@ -29,6 +28,9 @@ from services.dashboard_ops_service import (
     build_jobs_status as _build_jobs_status_payload,
     build_operational_summary_text as _build_operational_summary_payload,
 )
+from services import finance_payload_service
+from services import dashboard_payload_service
+from services import clientes_service
 from models.activity_models import ActivityEntry
 
 from views.login_view import LoginView
@@ -39,6 +41,7 @@ from views.cadastro_empresa_view import CadastroEmpresaView
 from views.registrar_pagamento_view import RegistrarPagamentoView
 from views.listar_clientes_view import ListarClientesView
 from views.listar_empresas_view import ListarEmpresasView
+from views.relatorios_view import RelatoriosView
 from views.role_utils import normalize_role as _shared_normalize_role
 from openpyxl import Workbook, load_workbook   
 from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
@@ -62,6 +65,10 @@ def _sanitize_error_text(text: str) -> str:
     msg = re.sub(r"(?i)(token\\s*=\\s*)([^\\s;]+)", r"\1***", msg)
     msg = re.sub(r"(?i)(apikey\\s*=\\s*)([^\\s;]+)", r"\1***", msg)
     return msg.strip()
+
+
+def _only_digits(value: str) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
 
 
 def _is_windows_11() -> bool:
@@ -632,23 +639,38 @@ class MainWindow(QMainWindow):
         self._last_operational_summary_date = ""
         self._last_due_digest_date = ""
         self._email_workers: list[_Worker] = []
+        self._cobranca_workers: list[_Worker] = []
         self._contract_workers: list[_Worker] = []
         self._cliente_save_workers: list[_Worker] = []
         self._pagamento_register_workers: list[_Worker] = []
         self._cliente_delete_workers: list[_Worker] = []
         self._empresa_delete_workers: list[_Worker] = []
         self._cancelar_plano_workers: list[_Worker] = []
+        self._renovar_contrato_workers: list[_Worker] = []
+        self._renovar_lote_workers: list[_Worker] = []
         self._reajuste_workers: list[_Worker] = []
+        self._status_sync_workers: list[_Worker] = []
         self._cliente_save_inflight = False
         self._pagamento_register_inflight = False
         self._cliente_delete_inflight = False
         self._empresa_delete_inflight = False
         self._cancelar_plano_inflight = False
+        self._renovar_contrato_inflight = False
+        self._renovar_lote_inflight = False
         self._reajuste_inflight = False
+        self._status_sync_inflight = False
+        self._status_sync_pending_force = False
         self._empresa_save_workers: list[_Worker] = []
         self._empresa_save_inflight = False
         self._nivel_usuario = ""
+        self._usuario_atual = ""
+        self._layout_density = "normal"
+        self._finance_prefs_loaded_user = ""
+        self._finance_pref_query: dict = {}
+        self._contas_pref_query: dict = {}
         self._last_auto_export_key = ""
+        self._last_auto_cobranca_key = ""
+        self._auto_cobranca_inflight = False
         self._auto_export_timer = QTimer(self)
         self._auto_export_timer.setInterval(600_000)
         self._auto_export_timer.timeout.connect(self._auto_export_tick)
@@ -656,12 +678,20 @@ class MainWindow(QMainWindow):
             self._auto_export_timer.start()
             QTimer.singleShot(5_000, self._auto_export_tick)
 
+        self._auto_cobranca_timer = QTimer(self)
+        self._auto_cobranca_timer.setInterval(600_000)
+        self._auto_cobranca_timer.timeout.connect(self._auto_cobranca_tick)
+        if _env_flag("MEDCONTRACT_AUTO_COBRANCA_ENABLED", True):
+            self._auto_cobranca_timer.start()
+            QTimer.singleShot(8_000, self._auto_cobranca_tick)
+
         self._apply_best_window_size()
 
         root = QWidget()
         root.setObjectName("windowRoot")
         root.setAttribute(Qt.WA_StyledBackground, True)
         root_layout = QVBoxLayout(root)
+        self._root_layout = root_layout
         if self._performance_mode:
             root_layout.setContentsMargins(0, 0, 0, 0)
         else:
@@ -719,6 +749,7 @@ class MainWindow(QMainWindow):
         self.pagamento = RegistrarPagamentoView()
         self.listar = ListarClientesView()
         self.listar_empresas = ListarEmpresasView()
+        self.relatorios = RelatoriosView()
 
         self.stack.addWidget(self.login)
         self.stack.addWidget(self.dashboard)
@@ -728,6 +759,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.pagamento)
         self.stack.addWidget(self.listar)
         self.stack.addWidget(self.listar_empresas)
+        self.stack.addWidget(self.relatorios)
 
         self.stack.setCurrentWidget(self.login)
 
@@ -740,13 +772,126 @@ class MainWindow(QMainWindow):
         self._shortcut_refresh = QShortcut(QKeySequence("F5"), self)
         self._shortcut_refresh.activated.connect(self._on_global_refresh)
 
+        self._finance_prefs_save_timer = QTimer(self)
+        self._finance_prefs_save_timer.setSingleShot(True)
+        self._finance_prefs_save_timer.setInterval(420)
+        self._finance_prefs_save_timer.timeout.connect(self._persist_finance_preferences)
+
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.setInterval(180_000 if self._performance_mode else 60_000)
         self._auto_refresh_timer.timeout.connect(self._auto_refresh_tick)
         self._auto_refresh_timer.start()
 
+        self._status_sync_timer = QTimer(self)
+        self._status_sync_timer.setSingleShot(True)
+        self._status_sync_timer.timeout.connect(self._on_status_sync_daily_tick)
+        self._schedule_next_status_sync()
+        QTimer.singleShot(2_000, lambda: self._run_status_sync_async(force=True, reason="startup"))
+
     def _role(self) -> str:
         return _normalize_role(self._nivel_usuario)
+
+    def _show_modern_question(
+        self,
+        *,
+        title: str,
+        subtitle: str = "",
+        details: str = "",
+        confirm_text: str = "Confirmar",
+        cancel_text: str = "Cancelar",
+    ) -> bool:
+        dlg = QDialog(self)
+        dlg.setModal(True)
+        dlg.setWindowTitle(title)
+        dlg.setObjectName("SaasConfirmDialog")
+        dlg.setMinimumWidth(540)
+
+        root = QVBoxLayout(dlg)
+        root.setContentsMargins(20, 18, 20, 16)
+        root.setSpacing(10)
+
+        lbl_title = QLabel(title)
+        lbl_title.setObjectName("dlgTitle")
+        root.addWidget(lbl_title)
+
+        if str(subtitle or "").strip():
+            lbl_sub = QLabel(str(subtitle or "").strip())
+            lbl_sub.setObjectName("dlgSub")
+            lbl_sub.setWordWrap(True)
+            root.addWidget(lbl_sub)
+
+        if str(details or "").strip():
+            lbl_details = QLabel(str(details or "").strip())
+            lbl_details.setObjectName("dlgBody")
+            lbl_details.setWordWrap(True)
+            root.addWidget(lbl_details)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        btn_cancel = QPushButton(cancel_text)
+        btn_cancel.setObjectName("dlgBtnSecondary")
+        btn_cancel.setFixedHeight(36)
+        btn_ok = QPushButton(confirm_text)
+        btn_ok.setObjectName("dlgBtnPrimary")
+        btn_ok.setFixedHeight(36)
+        actions.addWidget(btn_cancel)
+        actions.addWidget(btn_ok)
+        root.addLayout(actions)
+
+        dlg.setStyleSheet(
+            """
+            QDialog#SaasConfirmDialog {
+                background: #ffffff;
+                border: 1px solid rgba(15, 23, 42, 0.12);
+                border-radius: 14px;
+                font-family: Segoe UI;
+            }
+            QLabel#dlgTitle {
+                font-size: 18px;
+                font-weight: 800;
+                color: #0f172a;
+            }
+            QLabel#dlgSub {
+                font-size: 12px;
+                font-weight: 600;
+                color: #475569;
+            }
+            QLabel#dlgBody {
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 10px;
+                padding: 12px 14px;
+                color: #0f172a;
+                font-size: 12px;
+            }
+            QPushButton#dlgBtnPrimary {
+                min-width: 160px;
+                border: none;
+                border-radius: 8px;
+                background: #2b6c7e;
+                color: white;
+                font-weight: 800;
+                padding: 0 14px;
+            }
+            QPushButton#dlgBtnPrimary:hover { background: #2f768a; }
+            QPushButton#dlgBtnSecondary {
+                border: 1px solid rgba(15, 23, 42, 0.16);
+                border-radius: 8px;
+                background: #ffffff;
+                color: #0f172a;
+                font-weight: 700;
+                padding: 0 14px;
+            }
+            QPushButton#dlgBtnSecondary:hover {
+                border-color: rgba(43, 108, 126, 0.62);
+                color: #1f5f72;
+            }
+            """
+        )
+
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        return dlg.exec() == QDialog.Accepted
 
     def _can_access_financeiro(self) -> bool:
         role = self._role()
@@ -858,6 +1003,8 @@ class MainWindow(QMainWindow):
             self.dashboard.ir_cadastro_empresa_signal.connect(self.ir_para_cadastro_empresa_create)
         if hasattr(self.dashboard, "ir_listar_empresas_signal"):
             self.dashboard.ir_listar_empresas_signal.connect(self.ir_para_listar_empresas)
+        if hasattr(self.dashboard, "ir_relatorios_signal"):
+            self.dashboard.ir_relatorios_signal.connect(self.ir_para_relatorios)
         if hasattr(self.dashboard, "ir_financeiro_signal"):
             self.dashboard.ir_financeiro_signal.connect(self.ir_para_financeiro)
         if hasattr(self.dashboard, "ir_listar_filtrado_signal"):
@@ -870,13 +1017,14 @@ class MainWindow(QMainWindow):
             self.dashboard.refresh_signal.connect(lambda: self.atualizar_dashboard_async(force=True))
         if hasattr(self.dashboard, "period_changed_signal"):
             self.dashboard.period_changed_signal.connect(self._on_dashboard_period_changed)
-
         if hasattr(self.dashboard, "export_clientes_signal"):
             self.dashboard.export_clientes_signal.connect(self.exportar_clientes)
         if hasattr(self.dashboard, "export_inadimplentes_signal"):
             self.dashboard.export_inadimplentes_signal.connect(self.exportar_inadimplentes)
         if hasattr(self.dashboard, "export_pagamentos_mes_signal"):
             self.dashboard.export_pagamentos_mes_signal.connect(self.exportar_pagamentos_mes)
+        if hasattr(self.dashboard, "backup_now_signal"):
+            self.dashboard.backup_now_signal.connect(self.fazer_backup)
 
         self.cadastro.voltar_signal.connect(lambda: self.stack.setCurrentWidget(self.dashboard))
         self.cadastro_empresa.voltar_signal.connect(lambda: self.stack.setCurrentWidget(self.dashboard))
@@ -885,6 +1033,7 @@ class MainWindow(QMainWindow):
         self.pagamento.voltar_signal.connect(lambda: self.stack.setCurrentWidget(self.dashboard))
         self.listar.voltar_signal.connect(lambda: self.stack.setCurrentWidget(self.dashboard))
         self.listar_empresas.voltar_signal.connect(lambda: self.stack.setCurrentWidget(self.dashboard))
+        self.relatorios.voltar_signal.connect(lambda: self.stack.setCurrentWidget(self.dashboard))
         self.financeiro.voltar_signal.connect(lambda: self.stack.setCurrentWidget(self.dashboard))
         self.financeiro.refresh_signal.connect(
             lambda mes: self.atualizar_financeiro_async(
@@ -902,21 +1051,9 @@ class MainWindow(QMainWindow):
                 )
             )
         if hasattr(self.financeiro, "query_changed_signal"):
-            self.financeiro.query_changed_signal.connect(
-                lambda query: self.atualizar_financeiro_async(
-                    self.financeiro.current_month(),
-                    force=False,
-                    query=query,
-                )
-            )
+            self.financeiro.query_changed_signal.connect(self._on_finance_query_changed)
         if hasattr(self.financeiro, "contas_query_changed_signal"):
-            self.financeiro.contas_query_changed_signal.connect(
-                lambda query: self.atualizar_contas_pagar_async(
-                    self.financeiro.current_month(),
-                    force=False,
-                    query=query,
-                )
-            )
+            self.financeiro.contas_query_changed_signal.connect(self._on_contas_query_changed)
         if hasattr(self.financeiro, "export_signal"):
             self.financeiro.export_signal.connect(self.exportar_financeiro_filtrado)
         if hasattr(self.financeiro, "contas_export_signal"):
@@ -946,6 +1083,10 @@ class MainWindow(QMainWindow):
             self.listar.excluir_signal.connect(self.excluir_cliente_por_mat)
         if hasattr(self.listar, "cancelar_plano_signal"):
             self.listar.cancelar_plano_signal.connect(self.cancelar_plano_cliente_por_mat)
+        if hasattr(self.listar, "renovar_contrato_signal"):
+            self.listar.renovar_contrato_signal.connect(self.renovar_contrato_cliente_por_mat)
+        if hasattr(self.listar, "renovar_contratos_signal"):
+            self.listar.renovar_contratos_signal.connect(self.renovar_contratos_marcados)
         if hasattr(self.listar, "reajuste_planos_signal"):
             self.listar.reajuste_planos_signal.connect(self.aplicar_reajuste_planos)
         if hasattr(self.listar, "enviar_email_signal"):
@@ -972,6 +1113,152 @@ class MainWindow(QMainWindow):
         rows = db.buscar_empresas_por_nome(nome, limit=20)
         return [{"id": r[0], "nome": r[1], "cnpj": r[2]} for r in rows]
 
+    def _current_user_for_preferences(self) -> str:
+        username = str(self._usuario_atual or "").strip()
+        if not username and hasattr(self.login, "username_input"):
+            try:
+                username = str(self.login.username_input.text() or "").strip()
+            except Exception:
+                username = ""
+        if username:
+            return username
+        role = str(self._nivel_usuario or "").strip().lower()
+        return f"role:{role or 'anon'}"
+
+    def _apply_layout_density(self, density: str):
+        mode = str(density or "").strip().lower()
+        if mode not in {"normal", "compact"}:
+            mode = "normal"
+        self._layout_density = mode
+
+        try:
+            if self._performance_mode:
+                margins = (0, 0, 0, 0)
+            elif mode == "compact":
+                margins = (10, 10, 10, 10)
+            else:
+                margins = (18, 18, 18, 18)
+            if hasattr(self, "_root_layout"):
+                self._root_layout.setContentsMargins(*margins)
+                self._root_layout.setSpacing(0)
+        except Exception:
+            logger.debug("Falha ao aplicar densidade no layout raiz.", exc_info=True)
+
+        for view, method in (
+            (self.dashboard, "set_density"),
+            (self.financeiro, "set_density"),
+        ):
+            if hasattr(view, method):
+                try:
+                    getattr(view, method)(mode)
+                except Exception:
+                    logger.debug("Falha ao aplicar densidade na view %s.", str(type(view).__name__), exc_info=True)
+
+    def _apply_user_preferences(self, force_load: bool = False):
+        _ = force_load
+
+        # Preferências removidas: valores globais fixos.
+        refresh_s = 60
+        try:
+            self._auto_refresh_timer.setInterval(int(refresh_s * 1000))
+        except Exception:
+            logger.debug("Falha ao aplicar intervalo de auto refresh.", exc_info=True)
+
+        period_key = "month"
+        self._dashboard_period = period_key
+
+        self._apply_layout_density("normal")
+
+        apply_period = True
+        if apply_period and hasattr(self.dashboard, "set_period"):
+            try:
+                self.dashboard.set_period(period_key, emit_signal=False)
+            except Exception:
+                logger.debug("Falha ao aplicar período padrão do dashboard.", exc_info=True)
+
+        # Tamanho padrão das grades financeiras.
+        fin_page_size = 50
+        contas_page_size = 50
+        if hasattr(self.financeiro, "set_page_sizes"):
+            try:
+                self.financeiro.set_page_sizes(fin_page_size, contas_page_size)
+            except Exception:
+                logger.debug("Falha ao aplicar page size no financeiro.", exc_info=True)
+
+    def _on_finance_query_changed(self, query: dict):
+        safe_query = self._normalize_finance_query(query)
+        self._queue_save_finance_preferences(finance_query=safe_query)
+        self.atualizar_financeiro_async(
+            self.financeiro.current_month(),
+            force=False,
+            query=safe_query,
+        )
+
+    def _on_contas_query_changed(self, query: dict):
+        safe_query = dict(query or {})
+        self._queue_save_finance_preferences(contas_query=safe_query)
+        self.atualizar_contas_pagar_async(
+            self.financeiro.current_month(),
+            force=False,
+            query=safe_query,
+        )
+
+    def _queue_save_finance_preferences(
+        self,
+        *,
+        finance_query: dict | None = None,
+        contas_query: dict | None = None,
+    ):
+        if finance_query is not None:
+            self._finance_pref_query = self._normalize_finance_query(finance_query)
+        if contas_query is not None:
+            self._contas_pref_query = dict(contas_query or {})
+        self._finance_prefs_save_timer.start()
+
+    def _persist_finance_preferences(self):
+        user_key = self._current_user_for_preferences()
+        payload = {
+            "financeiro_query": dict(self._finance_pref_query or {}),
+            "contas_query": dict(self._contas_pref_query or {}),
+        }
+        try:
+            db.salvar_preferencias_financeiro_usuario(user_key, payload)
+        except Exception:
+            logger.debug("Falha ao salvar preferências de filtros do financeiro.", exc_info=True)
+
+    def _apply_finance_preferences_to_view(self):
+        user_key = self._current_user_for_preferences()
+        if self._finance_prefs_loaded_user == user_key:
+            return
+
+        try:
+            prefs = db.obter_preferencias_financeiro_usuario(user_key) or {}
+        except Exception:
+            logger.debug("Falha ao carregar preferências de filtros do financeiro.", exc_info=True)
+            prefs = {}
+
+        fin_q = dict(prefs.get("financeiro_query") or {})
+        contas_q = dict(prefs.get("contas_query") or {})
+        if not fin_q and hasattr(self.financeiro, "current_query"):
+            fin_q = self._normalize_finance_query(self.financeiro.current_query())
+        else:
+            fin_q = self._normalize_finance_query(fin_q)
+        if not contas_q and hasattr(self.financeiro, "current_contas_query"):
+            contas_q = dict(self.financeiro.current_contas_query() or {})
+
+        self._finance_pref_query = dict(fin_q)
+        self._contas_pref_query = dict(contas_q)
+
+        try:
+            if hasattr(self.financeiro, "apply_saved_query"):
+                self.financeiro.apply_saved_query(fin_q, emit_remote=False)
+            if hasattr(self.financeiro, "apply_saved_contas_query"):
+                self.financeiro.apply_saved_contas_query(contas_q, emit_remote=False)
+        except Exception:
+            logger.debug("Falha ao aplicar preferências de filtros no financeiro.", exc_info=True)
+
+        self._finance_prefs_loaded_user = user_key
+
     # ============================
     # Rotas
     # ============================
@@ -990,6 +1277,8 @@ class MainWindow(QMainWindow):
 
     def ir_para_dashboard(self, nivel: str):
         self._nivel_usuario = str(nivel or "")
+        self._usuario_atual = self._current_user_for_preferences()
+        self._finance_prefs_loaded_user = ""
         self._shortcut_backup.setEnabled(self._can_backup())
         if hasattr(self.dashboard, "set_nivel_usuario"):
             self.dashboard.set_nivel_usuario(nivel)
@@ -999,12 +1288,18 @@ class MainWindow(QMainWindow):
             self.listar.set_nivel_usuario(nivel)
         if hasattr(self.listar_empresas, "set_nivel_usuario"):
             self.listar_empresas.set_nivel_usuario(nivel)
+        self._apply_user_preferences(force_load=True)
 
         self.stack.setCurrentWidget(self.dashboard)
+        self._run_status_sync_async(force=True, reason="login")
         self.atualizar_dashboard_async()
 
     def ir_para_login(self):
         self._nivel_usuario = ""
+        self._usuario_atual = ""
+        self._finance_prefs_loaded_user = ""
+        self._finance_pref_query = {}
+        self._contas_pref_query = {}
         self._shortcut_backup.setEnabled(False)
         if hasattr(self.dashboard, "set_nivel_usuario"):
             self.dashboard.set_nivel_usuario("")
@@ -1040,12 +1335,6 @@ class MainWindow(QMainWindow):
         self.ir_para_cadastro_create()
         if self.stack.currentWidget() is not self.cadastro:
             return
-        if hasattr(self.cadastro, "_show_message"):
-            self.cadastro._show_message(
-                "Fluxo novo contrato: 1) Cliente, 2) Endereço, 3) Contrato, 4) Dependentes. Revise e confirme no final.",
-                ok=True,
-                ms=3600,
-            )
         try:
             if hasattr(self.cadastro, "nome") and isinstance(self.cadastro.nome, dict):
                 self.cadastro.nome["input"].setFocus()
@@ -1093,6 +1382,7 @@ class MainWindow(QMainWindow):
             self.financeiro.set_contas_month_options(opts, current)
         if hasattr(self.financeiro, "set_nivel_usuario"):
             self.financeiro.set_nivel_usuario(self._nivel_usuario)
+        self._apply_finance_preferences_to_view()
 
         self.stack.setCurrentWidget(self.financeiro)
         if hasattr(self.financeiro, "_emit_refresh"):
@@ -1111,6 +1401,14 @@ class MainWindow(QMainWindow):
         if hasattr(self.listar_empresas, "reload"):
             self.listar_empresas.reload()
         self.stack.setCurrentWidget(self.listar_empresas)
+
+    def ir_para_relatorios(self):
+        reports_root = db.get_app_data_dir() / "reports"
+        if hasattr(self.relatorios, "set_reports_root"):
+            self.relatorios.set_reports_root(reports_root)
+        if hasattr(self.relatorios, "reload"):
+            self.relatorios.reload()
+        self.stack.setCurrentWidget(self.relatorios)
 
     def ir_para_listar_filtrado(self, search_text: str = "", status: str = "", pagamento: str = ""):
         if hasattr(self.listar, "open_with_filters"):
@@ -1255,6 +1553,95 @@ class MainWindow(QMainWindow):
                 self.listar_empresas.reload()
         else:
             self.atualizar_dashboard_async(force=True)
+
+    def _ms_until_next_status_sync(self) -> int:
+        now = datetime.now()
+        next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        ms = int((next_run - now).total_seconds() * 1000)
+        return max(30_000, ms)
+
+    def _schedule_next_status_sync(self):
+        try:
+            self._status_sync_timer.stop()
+            self._status_sync_timer.start(self._ms_until_next_status_sync())
+        except Exception:
+            pass
+
+    def _on_status_sync_daily_tick(self):
+        self._run_status_sync_async(force=True, reason="daily")
+        self._schedule_next_status_sync()
+
+    def _run_status_sync_async(self, *, force: bool = False, reason: str = ""):
+        if self._status_sync_inflight:
+            self._status_sync_pending_force = self._status_sync_pending_force or bool(force)
+            return
+
+        self._status_sync_inflight = True
+        why = str(reason or "").strip().lower()
+        worker = _Worker(lambda: db.sincronizar_status_pagamento_clientes(force=bool(force)))
+        self._status_sync_workers.append(worker)
+
+        def _cleanup():
+            self._status_sync_inflight = False
+            try:
+                self._status_sync_workers.remove(worker)
+            except Exception:
+                pass
+
+        def _flush_pending_if_any():
+            if not self._status_sync_pending_force:
+                return
+            force_pending = bool(self._status_sync_pending_force)
+            self._status_sync_pending_force = False
+            QTimer.singleShot(0, lambda: self._run_status_sync_async(force=force_pending, reason="pending"))
+
+        def _refresh_current_view_if_needed():
+            current = self.stack.currentWidget()
+            if current is self.dashboard:
+                self._invalidate_dashboard_cache()
+                self.atualizar_dashboard_async(force=True)
+                return
+            if current is self.listar and hasattr(self.listar, "reload"):
+                self.listar.reload()
+                return
+            if current is self.financeiro and self._can_access_financeiro():
+                self.atualizar_financeiro_async(
+                    self.financeiro.current_month(),
+                    force=True,
+                    query=(self.financeiro.current_query() if hasattr(self.financeiro, "current_query") else None),
+                )
+                return
+
+        def _on_result(result: dict):
+            _cleanup()
+            out = dict(result or {})
+            updated = int(out.get("atualizados", 0) or 0)
+            skipped = bool(out.get("skipped", False))
+            if updated > 0:
+                _refresh_current_view_if_needed()
+            if updated > 0 or why in {"startup", "daily"}:
+                logger.info(
+                    "Sincronização de status dos clientes concluída: mes=%s atrasados=%s atualizados=%s skipped=%s reason=%s",
+                    str(out.get("mes_ref") or ""),
+                    int(out.get("atrasados", 0) or 0),
+                    updated,
+                    skipped,
+                    why or "-",
+                )
+            _flush_pending_if_any()
+
+        def _on_error(error_msg: str):
+            _cleanup()
+            logger.warning(
+                "Falha ao sincronizar status de pagamento dos clientes (%s): %s",
+                why or "manual",
+                str(error_msg or ""),
+            )
+            _flush_pending_if_any()
+
+        worker.signals.result.connect(_on_result)
+        worker.signals.error.connect(_on_error)
+        self._thread_pool.start(worker)
 
     # ============================
     # Backup
@@ -1584,444 +1971,24 @@ class MainWindow(QMainWindow):
         self._schedule_dashboard_refresh_if_pending()
 
     def _compute_dashboard_payload(self, period: str = "month") -> dict:
-        now = datetime.now()
-        today = now.date()
-        mes_iso = now.strftime("%Y-%m")
-
-        period_key = (period or "month").strip().lower()
-        if period_key not in {"month", "7d", "today"}:
-            period_key = "month"
-
-        if period_key == "today":
-            start_date = today
-            end_date = today
-            period_desc = "Hoje"
-            period_chart_label = "hoje"
-        elif period_key == "7d":
-            start_date = today - timedelta(days=6)
-            end_date = today
-            period_desc = "Últimos 7 dias"
-            period_chart_label = "7 dias"
-        else:
-            start_date = today.replace(day=1)
-            end_date = today
-            period_desc = f"Mês {iso_to_mes_ref_br(mes_iso)}"
-            period_chart_label = f"mês {iso_to_mes_ref_br(mes_iso)}"
-
-        start_iso = start_date.isoformat()
-        end_iso = end_date.isoformat()
-
-        span_days = (end_date - start_date).days + 1
-        prev_end_date = start_date - timedelta(days=1)
-        prev_start_date = prev_end_date - timedelta(days=max(span_days - 1, 0))
-        prev_start_iso = prev_start_date.isoformat()
-        prev_end_iso = prev_end_date.isoformat()
-
-        def _last_day(year: int, month: int) -> int:
-            return int(monthrange(year, month)[1])
-
-        def _next_due_date(ref_date, due_day: int):
-            year = int(ref_date.year)
-            month = int(ref_date.month)
-            day = min(int(due_day), _last_day(year, month))
-            candidate = ref_date.replace(year=year, month=month, day=day)
-            if candidate < ref_date:
-                if month == 12:
-                    year += 1
-                    month = 1
-                else:
-                    month += 1
-                day = min(int(due_day), _last_day(year, month))
-                candidate = ref_date.replace(year=year, month=month, day=day)
-            return candidate
-
-        def _money_to_float(v) -> float:
-            if v is None:
-                return 0.0
-            if isinstance(v, (int, float)):
-                return float(v)
-            txt = str(v).strip()
-            if not txt:
-                return 0.0
-            txt = txt.replace("R$", "").replace("r$", "").replace(" ", "")
-            if not txt:
-                return 0.0
-            if "," in txt and "." in txt:
-                if txt.rfind(",") > txt.rfind("."):
-                    txt = txt.replace(".", "").replace(",", ".")
-                else:
-                    txt = txt.replace(",", "")
-            elif "," in txt:
-                txt = txt.replace(".", "").replace(",", ".")
-            try:
-                return float(txt)
-            except Exception:
-                return 0.0
-
-        status_counts = {"ativos": 0, "atrasados": 0, "inativos": 0}
-        total_clientes = 0
-        atraso_estimado = 0.0
-        pagamentos_mes = 0
-        pagamentos_prev = 0
-        pagamentos_hoje = 0
-        fechados_mes = 0
-        fechados_prev = 0
-        hoje_qtd = 0
-        contratos_empresa = {
-            "total_empresas": 0,
-            "novos_periodo": 0,
-            "ativos": 0,
-            "atrasados": 0,
-            "inativos": 0,
-        }
-        entrada_7d_clientes = 0.0
-        entrada_15d_clientes = 0.0
-        entrada_30d_clientes = 0.0
-        qtd_7d_clientes = 0
-        qtd_15d_clientes = 0
-        qtd_30d_clientes = 0
-        entrada_7d_empresas = 0.0
-        entrada_15d_empresas = 0.0
-        entrada_30d_empresas = 0.0
-        qtd_7d_empresas = 0
-        qtd_15d_empresas = 0
-        qtd_30d_empresas = 0
-        entrada_7d = 0.0
-        entrada_15d = 0.0
-        entrada_30d = 0.0
-        qtd_7d = 0
-        qtd_15d = 0
-        qtd_30d = 0
-        clientes_base = 0
-        clientes_atrasados = 0
-        empresas_base = 0
-        empresas_em_risco = 0
-        valor_atraso_empresas = 0.0
-        base_total = 0
-        em_risco_total = 0
-        taxa_inadimplencia = 0.0
-        taxa_inadimplencia_clientes = 0.0
-        taxa_inadimplencia_empresas = 0.0
-        risco_7d = 0.0
-        risco_15d = 0.0
-        risco_30d = 0.0
-        previsao_liquida_7d = 0.0
-        previsao_liquida_15d = 0.0
-        previsao_liquida_30d = 0.0
-        risco_nivel = "baixo"
-        conn = None
+        payload = dashboard_payload_service.compute_dashboard_payload(
+            db,
+            period,
+            iso_to_mes_ref_br_fn=iso_to_mes_ref_br,
+            log_debug=lambda message: logger.debug(str(message or ""), exc_info=True),
+            alert_user=self._current_user_for_preferences(),
+        )
         try:
-            conn = db.connect()
-            cur = conn.cursor()
-
-            cur.execute(
-                """
-                SELECT
-                    COUNT(*) AS total_clientes,
-                    COALESCE(SUM(CASE WHEN status = 'ativo' THEN 1 ELSE 0 END), 0) AS ativos,
-                    COALESCE(SUM(CASE WHEN pagamento_status = 'atrasado' THEN 1 ELSE 0 END), 0) AS atrasados,
-                    COALESCE(SUM(CASE WHEN status = 'inativo' THEN 1 ELSE 0 END), 0) AS inativos,
-                    COALESCE(SUM(CASE WHEN status <> 'inativo' AND pagamento_status = 'atrasado' THEN valor_mensal ELSE 0 END), 0) AS atraso_estimado,
-                    COALESCE(SUM(CASE WHEN data_inicio BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS fechados_periodo,
-                    COALESCE(SUM(CASE WHEN data_inicio BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS fechados_prev,
-                    COALESCE(SUM(CASE WHEN data_inicio = ? THEN 1 ELSE 0 END), 0) AS fechados_hoje
-                FROM clientes
-                """,
-                (start_iso, end_iso, prev_start_iso, prev_end_iso, today.isoformat()),
-            )
-            row = cur.fetchone() or (0, 0, 0, 0, 0, 0, 0, 0)
-            total_clientes = int(row[0] or 0)
-            status_counts = {
-                "ativos": int(row[1] or 0),
-                "atrasados": int(row[2] or 0),
-                "inativos": int(row[3] or 0),
-            }
-            atraso_estimado = float(row[4] or 0.0)
-            fechados_mes = int(row[5] or 0)
-            fechados_prev = int(row[6] or 0)
-            hoje_qtd = int(row[7] or 0)
-
-            cur.execute(
-                """
-                SELECT
-                    COALESCE(SUM(CASE WHEN data_pagamento BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS pagamentos_periodo,
-                    COALESCE(SUM(CASE WHEN data_pagamento BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS pagamentos_prev,
-                    COALESCE(SUM(CASE WHEN data_pagamento = ? THEN 1 ELSE 0 END), 0) AS pagamentos_hoje
-                FROM pagamentos
-                """,
-                (start_iso, end_iso, prev_start_iso, prev_end_iso, today.isoformat()),
-            )
-            pay_row = cur.fetchone() or (0, 0, 0)
-            pagamentos_mes = int(pay_row[0] or 0)
-            pagamentos_prev = int(pay_row[1] or 0)
-            pagamentos_hoje = int(pay_row[2] or 0)
-
-            cur.execute(
-                """
-                SELECT
-                    COUNT(*) AS total_empresas,
-                    COALESCE(SUM(CASE WHEN data_cadastro BETWEEN ? AND ? THEN 1 ELSE 0 END), 0) AS novos_periodo,
-                    COALESCE(SUM(CASE WHEN status_pagamento = 'em_dia' THEN 1 ELSE 0 END), 0) AS ativos,
-                    COALESCE(SUM(CASE WHEN status_pagamento = 'pendente' THEN 1 ELSE 0 END), 0) AS atrasados,
-                    COALESCE(SUM(CASE WHEN status_pagamento = 'inadimplente' THEN 1 ELSE 0 END), 0) AS inativos
-                FROM empresas
-                """,
-                (start_iso, end_iso),
-            )
-            company_row = cur.fetchone() or (0, 0, 0, 0, 0)
-            contratos_empresa = {
-                "total_empresas": int(company_row[0] or 0),
-                "novos_periodo": int(company_row[1] or 0),
-                "ativos": int(company_row[2] or 0),
-                "atrasados": int(company_row[3] or 0),
-                "inativos": int(company_row[4] or 0),
-            }
-
-            cur.execute(
-                """
-                SELECT
-                    id,
-                    COALESCE(nome, '') AS nome,
-                    COALESCE(vencimento_dia, 10) AS vencimento_dia,
-                    COALESCE(valor_mensal, 0) AS valor_mensal,
-                    COALESCE(pagamento_status, 'em_dia') AS pagamento_status
-                FROM clientes
-                WHERE status <> 'inativo'
-                  AND COALESCE(valor_mensal, 0) > 0
-                """
-            )
-            forecast_rows = cur.fetchall() or []
-            clientes_base = len(forecast_rows)
-
-            for cliente_id_raw, cliente_nome_raw, venc_raw, valor_raw, pagamento_raw in forecast_rows:
-                try:
-                    valor = float(valor_raw or 0.0)
-                except Exception:
-                    valor = 0.0
-                if valor <= 0:
-                    continue
-
-                cliente_id = int(cliente_id_raw or 0)
-                cliente_nome = str(cliente_nome_raw or "").strip() or f"Cliente #{cliente_id}"
-                try:
-                    vencimento_dia = int(venc_raw or 10)
-                except Exception:
-                    vencimento_dia = 10
-                vencimento_dia = max(1, min(31, vencimento_dia))
-
-                proximo_vencimento = _next_due_date(today, vencimento_dia)
-                dias_ate_vencimento = int((proximo_vencimento - today).days)
-
-                if dias_ate_vencimento <= 7:
-                    entrada_7d_clientes += valor
-                    qtd_7d_clientes += 1
-                if dias_ate_vencimento <= 15:
-                    entrada_15d_clientes += valor
-                    qtd_15d_clientes += 1
-                if dias_ate_vencimento <= 30:
-                    entrada_30d_clientes += valor
-                    qtd_30d_clientes += 1
-
-                status_pagamento = str(pagamento_raw or "").strip().lower()
-                if status_pagamento == "atrasado":
-                    clientes_atrasados += 1
-
-            cur.execute(
-                """
-                SELECT
-                    id,
-                    COALESCE(nome, '') AS nome,
-                    COALESCE(dia_vencimento, 10) AS dia_vencimento,
-                    COALESCE(valor_mensal, '0') AS valor_mensal,
-                    COALESCE(status_pagamento, 'em_dia') AS status_pagamento
-                FROM empresas
-                """
-            )
-            empresas_rows = cur.fetchall() or []
-            for empresa_id_raw, empresa_nome_raw, venc_raw, valor_raw, status_raw in empresas_rows:
-                valor = _money_to_float(valor_raw)
-                if valor <= 0:
-                    continue
-
-                empresa_id = int(empresa_id_raw or 0)
-                empresa_nome = str(empresa_nome_raw or "").strip() or f"Empresa #{empresa_id}"
-                empresas_base += 1
-                status_emp = str(status_raw or "").strip().lower()
-                if status_emp in {"pendente", "inadimplente"}:
-                    empresas_em_risco += 1
-                    valor_atraso_empresas += valor
-
-                try:
-                    vencimento_dia = int(venc_raw or 10)
-                except Exception:
-                    vencimento_dia = 10
-                vencimento_dia = max(1, min(31, vencimento_dia))
-
-                proximo_vencimento = _next_due_date(today, vencimento_dia)
-                dias_ate_vencimento = int((proximo_vencimento - today).days)
-
-                # Não projeta novas entradas para empresas já inadimplentes.
-                if status_emp != "inadimplente":
-                    if dias_ate_vencimento <= 7:
-                        entrada_7d_empresas += valor
-                        qtd_7d_empresas += 1
-                    if dias_ate_vencimento <= 15:
-                        entrada_15d_empresas += valor
-                        qtd_15d_empresas += 1
-                    if dias_ate_vencimento <= 30:
-                        entrada_30d_empresas += valor
-                        qtd_30d_empresas += 1
-
-            entrada_7d = float(entrada_7d_clientes + entrada_7d_empresas)
-            entrada_15d = float(entrada_15d_clientes + entrada_15d_empresas)
-            entrada_30d = float(entrada_30d_clientes + entrada_30d_empresas)
-            qtd_7d = int(qtd_7d_clientes + qtd_7d_empresas)
-            qtd_15d = int(qtd_15d_clientes + qtd_15d_empresas)
-            qtd_30d = int(qtd_30d_clientes + qtd_30d_empresas)
-
-            base_total = int(clientes_base + empresas_base)
-            em_risco_total = int(clientes_atrasados + empresas_em_risco)
-            if clientes_base > 0:
-                taxa_inadimplencia_clientes = float(clientes_atrasados) / float(clientes_base)
-            if empresas_base > 0:
-                taxa_inadimplencia_empresas = float(empresas_em_risco) / float(empresas_base)
-            if base_total > 0:
-                taxa_inadimplencia = float(em_risco_total) / float(base_total)
-                risco_7d = entrada_7d * taxa_inadimplencia
-                risco_15d = entrada_15d * taxa_inadimplencia
-                risco_30d = entrada_30d * taxa_inadimplencia
-
-            previsao_liquida_7d = max(0.0, entrada_7d - risco_7d)
-            previsao_liquida_15d = max(0.0, entrada_15d - risco_15d)
-            previsao_liquida_30d = max(0.0, entrada_30d - risco_30d)
-
-            if taxa_inadimplencia <= 0.05:
-                risco_nivel = "baixo"
-            elif taxa_inadimplencia <= 0.12:
-                risco_nivel = "medio"
-            elif taxa_inadimplencia <= 0.20:
-                risco_nivel = "alto"
-            else:
-                risco_nivel = "critico"
+            resumo = dict((payload or {}).get("resumo", {}) or {})
+            if self._export_history:
+                resumo["ultima_export"] = self._export_history[0].get("when", "-")
+            payload["resumo"] = resumo
         except Exception:
-            pass
-        finally:
-            try:
-                if conn:
-                    conn.close()
-            except Exception:
-                pass
+            logger.debug("Falha ao enriquecer payload do dashboard com dados locais.", exc_info=True)
 
-        forecast_end_30d = today + timedelta(days=30)
-        contratos_payload = {
-            "mes_ref": mes_iso,
-            "periodo_desc": period_desc,
-            "janela_inicio": today.isoformat(),
-            "janela_fim_30d": forecast_end_30d.isoformat(),
-            "janela_fim_30d_br": forecast_end_30d.strftime("%d/%m/%Y"),
-            "entrada_7d": round(float(entrada_7d), 2),
-            "entrada_15d": round(float(entrada_15d), 2),
-            "entrada_30d": round(float(entrada_30d), 2),
-            "qtd_7d": int(qtd_7d),
-            "qtd_15d": int(qtd_15d),
-            "qtd_30d": int(qtd_30d),
-            "entrada_7d_clientes": round(float(entrada_7d_clientes), 2),
-            "entrada_15d_clientes": round(float(entrada_15d_clientes), 2),
-            "entrada_30d_clientes": round(float(entrada_30d_clientes), 2),
-            "qtd_7d_clientes": int(qtd_7d_clientes),
-            "qtd_15d_clientes": int(qtd_15d_clientes),
-            "qtd_30d_clientes": int(qtd_30d_clientes),
-            "entrada_7d_empresas": round(float(entrada_7d_empresas), 2),
-            "entrada_15d_empresas": round(float(entrada_15d_empresas), 2),
-            "entrada_30d_empresas": round(float(entrada_30d_empresas), 2),
-            "qtd_7d_empresas": int(qtd_7d_empresas),
-            "qtd_15d_empresas": int(qtd_15d_empresas),
-            "qtd_30d_empresas": int(qtd_30d_empresas),
-            "clientes_base": int(clientes_base),
-            "clientes_atrasados": int(clientes_atrasados),
-            "empresas_base": int(empresas_base),
-            "empresas_em_risco": int(empresas_em_risco),
-            "base_total": int(base_total),
-            "em_risco_total": int(em_risco_total),
-            "taxa_inadimplencia": float(taxa_inadimplencia),
-            "taxa_inadimplencia_clientes": float(taxa_inadimplencia_clientes),
-            "taxa_inadimplencia_empresas": float(taxa_inadimplencia_empresas),
-            "risco_nivel": str(risco_nivel),
-            "risco_7d": round(float(risco_7d), 2),
-            "risco_15d": round(float(risco_15d), 2),
-            "risco_30d": round(float(risco_30d), 2),
-            "previsao_liquida_7d": round(float(previsao_liquida_7d), 2),
-            "previsao_liquida_15d": round(float(previsao_liquida_15d), 2),
-            "previsao_liquida_30d": round(float(previsao_liquida_30d), 2),
-            "valor_em_atraso_clientes": round(float(atraso_estimado), 2),
-            "valor_em_atraso_empresas": round(float(valor_atraso_empresas), 2),
-            "valor_em_atraso_atual": round(float(atraso_estimado + valor_atraso_empresas), 2),
-        }
-
-        live_metrics = {
-            "mes_ref": mes_iso,
-            "total_clientes": total_clientes,
-            "pagamentos_mes": pagamentos_mes,
-            "pagamentos_prev": pagamentos_prev,
-            "atraso_estimado": atraso_estimado,
-            "contratos_mes": fechados_mes,
-            "contratos_prev": fechados_prev,
-            "contratos_empresa_total": int(contratos_empresa.get("total_empresas", 0) or 0),
-            "ativos": int(status_counts.get("ativos", 0) or 0),
-            "atrasados": int(status_counts.get("atrasados", 0) or 0),
-            "inativos": int(status_counts.get("inativos", 0) or 0),
-            "periodo_desc": period_desc,
-        }
-
-        series = []
-
-        resumo = {
-            "pagamentos_periodo": int((pagamentos_hoje if period_key == "today" else pagamentos_mes) or 0),
-            "pagamentos_label": "Pagamentos hoje" if period_key == "today" else "Pagamentos no período",
-            "novos_mes": int(fechados_mes or 0),
-            "ultimo_backup": "-",
-            "ultima_export": "-",
-        }
-
-        try:
-            bkp_dir = db.get_backup_dir()
-            if bkp_dir.exists():
-                latest = None
-                latest_mtime = None
-                for p in bkp_dir.glob("medcontract_backup_*.*"):
-                    if not p.is_file() or p.suffix.lower() not in {".db", ".sql", ".json", ".dump"}:
-                        continue
-                    try:
-                        mtime = p.stat().st_mtime
-                    except Exception:
-                        continue
-                    if latest_mtime is None or mtime > latest_mtime:
-                        latest = p
-                        latest_mtime = mtime
-                if latest_mtime is not None:
-                    resumo["ultimo_backup"] = datetime.fromtimestamp(latest_mtime).strftime("%d/%m %H:%M")
-        except Exception:
-            pass
-
-        if self._export_history:
-            resumo["ultima_export"] = self._export_history[0].get("when", "-")
-
-        jobs_status = self._build_jobs_status(resumo)
-
-        return {
-            "status_counts": status_counts,
-            "live_metrics": live_metrics,
-            "series": series,
-            "resumo": resumo,
-            "contratos_mes": contratos_payload,
-            "finance_forecast": contratos_payload,
-            "period_desc": period_desc,
-            "period_chart_label": period_chart_label,
-            "export_history": list(self._export_history),
-            "recent_activities": list(self._activity_history[:6]),
-            "jobs_status": jobs_status,
-            "period_key": period_key,
-        }
+        payload["export_history"] = list(self._export_history)
+        payload["recent_activities"] = list(self._activity_history[:6])
+        return payload
 
     def _build_operational_summary_text(self, payload: dict) -> str:
         return _build_operational_summary_payload(payload, now=datetime.now())
@@ -2256,14 +2223,14 @@ class MainWindow(QMainWindow):
                     self.financeiro.set_payload(cached)
                     self.financeiro.set_loading(False)
                 except Exception:
-                    pass
+                    logger.debug("Falha ao aplicar payload financeiro em cache.", exc_info=True)
                 return
 
         self._finance_inflight = True
         try:
             self.financeiro.set_loading(True)
         except Exception:
-            pass
+            logger.debug("Falha ao marcar loading do financeiro.", exc_info=True)
 
         w = _Worker(self._compute_financeiro_payload, ref, q)
         w.signals.result.connect(self._apply_financeiro_payload)
@@ -2288,91 +2255,12 @@ class MainWindow(QMainWindow):
             self.financeiro.set_loading(False)
             self.financeiro.show_error(msg or "Falha ao atualizar painel financeiro.")
         except Exception:
-            pass
+            logger.debug("Falha ao exibir erro no painel financeiro.", exc_info=True)
         self._schedule_financeiro_refresh_if_pending()
 
     def _compute_financeiro_payload(self, mes_iso: str, query: dict | None = None) -> dict:
-        ref = (mes_iso or "").strip()
-        if len(ref) != 7 or ref[4] != "-":
-            ref = datetime.now().strftime("%Y-%m")
         q = self._normalize_finance_query(query)
-
-        base = {}
-        try:
-            base = db.carregar_financeiro_mes(ref, detail_limit=1) or {}
-        except Exception:
-            base = {}
-
-        details = {}
-        try:
-            details = db.listar_financeiro_detalhado_payload(
-                ref,
-                page=int(q.get("page", 0) or 0),
-                limit=int(q.get("page_size", 50) or 50),
-                search_doc=str(q.get("search_doc", "") or ""),
-                search_name=str(q.get("search_name", "") or ""),
-                status_key=str(q.get("status_key", "") or ""),
-                min_value=q.get("min_value"),
-                max_value=q.get("max_value"),
-                only_atrasados=bool(q.get("only_atrasados", False)),
-                above_ticket=bool(q.get("above_ticket", False)),
-                ticket_ref=float(q.get("ticket_ref", 0.0) or 0.0),
-                only_today=bool(q.get("only_today", False)),
-                sort_key=str(q.get("sort_key", "data_pagamento") or "data_pagamento"),
-                sort_dir=str(q.get("sort_dir", "desc") or "desc"),
-            ) or {}
-        except Exception:
-            details = {"rows": [], "total": 0, "total_valor": 0.0, "page_safe": 0, "pages": 1, "page_size": int(q.get("page_size", 50) or 50)}
-
-        receita_total = float(base.get("receita_total", 0.0) or 0.0)
-        pagamentos = int(base.get("pagamentos", 0) or 0)
-        ticket_medio = float(base.get("ticket_medio", 0.0) or 0.0)
-        atraso_estimado = float(base.get("atraso_estimado", 0.0) or 0.0)
-        atrasados_count = int(base.get("atrasados_count", 0) or 0)
-
-        daily_totals: dict[int, float] = {}
-        for item in list(base.get("daily_totals", []) or []):
-            try:
-                day = int(item[0])
-                value = float(item[1] or 0.0)
-            except Exception:
-                continue
-            if day > 0:
-                daily_totals[day] = value
-
-        try:
-            year = int(ref[:4])
-            month = int(ref[5:7])
-            next_year = year + (1 if month == 12 else 0)
-            next_month = 1 if month == 12 else month + 1
-            days_in_month = (datetime(next_year, next_month, 1) - datetime(year, month, 1)).days
-        except Exception:
-            days_in_month = 31
-
-        daily_series: list[tuple[str, float]] = []
-        for day in range(1, days_in_month + 1):
-            daily_series.append((f"{day:02d}", float(daily_totals.get(day, 0.0))))
-
-        rows = list(details.get("rows", []) or [])
-
-        return {
-            "mes_ref": ref,
-            "receita_total": receita_total,
-            "pagamentos": pagamentos,
-            "ticket_medio": ticket_medio,
-            "atraso_estimado": atraso_estimado,
-            "atrasados_count": atrasados_count,
-            "daily_series": daily_series,
-            "rows": rows,
-            "rows_total": int(details.get("total", len(rows)) or 0),
-            "rows_total_valor": float(details.get("total_valor", 0.0) or 0.0),
-            "rows_page": int(details.get("page_safe", int(q.get("page", 0) or 0)) or 0),
-            "rows_pages": int(details.get("pages", 1) or 1),
-            "rows_page_size": int(details.get("page_size", int(q.get("page_size", 50) or 50)) or 50),
-            "sort_key": str(details.get("sort_key", q.get("sort_key", "data_pagamento")) or "data_pagamento"),
-            "sort_dir": str(details.get("sort_dir", q.get("sort_dir", "desc")) or "desc"),
-            "query": q,
-        }
+        return finance_payload_service.compute_financeiro_payload(db, mes_iso, q)
 
     def _apply_financeiro_payload(self, payload: dict):
         self._finance_inflight = False
@@ -2385,12 +2273,12 @@ class MainWindow(QMainWindow):
                     query=(payload or {}).get("query"),
                 )
         except Exception:
-            pass
+            logger.debug("Falha ao salvar cache do financeiro.", exc_info=True)
         try:
             self.financeiro.set_payload(payload or {})
             self.financeiro.set_loading(False)
         except Exception:
-            pass
+            logger.debug("Falha ao aplicar payload do financeiro.", exc_info=True)
         self._schedule_financeiro_refresh_if_pending()
 
     # ============================
@@ -2424,14 +2312,14 @@ class MainWindow(QMainWindow):
                     self.financeiro.set_contas_payload(cached)
                     self.financeiro.set_contas_loading(False)
                 except Exception:
-                    pass
+                    logger.debug("Falha ao aplicar payload de contas em cache.", exc_info=True)
                 return
 
         self._contas_inflight = True
         try:
             self.financeiro.set_contas_loading(True)
         except Exception:
-            pass
+            logger.debug("Falha ao marcar loading de contas a pagar.", exc_info=True)
 
         w = _Worker(self._compute_contas_pagar_payload, ref, q)
         w.signals.result.connect(self._apply_contas_pagar_payload)
@@ -2456,61 +2344,12 @@ class MainWindow(QMainWindow):
             self.financeiro.set_contas_loading(False)
             self.financeiro.show_contas_error(msg or "Falha ao atualizar contas a pagar.")
         except Exception:
-            pass
+            logger.debug("Falha ao exibir erro de contas a pagar.", exc_info=True)
         self._schedule_contas_pagar_refresh_if_pending()
 
     def _compute_contas_pagar_payload(self, mes_iso: str, query: dict | None = None) -> dict:
-        ref = (mes_iso or "").strip()
-        if len(ref) != 7 or ref[4] != "-":
-            ref = datetime.now().strftime("%Y-%m")
         q = dict(query or {})
-        try:
-            base = db.carregar_contas_pagar_mes(ref, detail_limit=1) or {}
-        except Exception:
-            base = {}
-        try:
-            details = db.listar_contas_pagar_detalhado_payload(
-                ref,
-                page=int(q.get("page", 0) or 0),
-                limit=int(q.get("page_size", 50) or 50),
-                search=str(q.get("search", "") or ""),
-                status=str(q.get("status", "") or ""),
-                categoria=str(q.get("categoria", "") or ""),
-                min_value=q.get("min_value"),
-                max_value=q.get("max_value"),
-                only_vencidas=bool(q.get("only_vencidas", False)),
-                vencem_hoje=bool(q.get("vencem_hoje", False)),
-                vencem_7d=bool(q.get("vencem_7d", False)),
-                sort_key=str(q.get("sort_key", "data_vencimento") or "data_vencimento"),
-                sort_dir=str(q.get("sort_dir", "asc") or "asc"),
-            ) or {}
-        except Exception:
-            details = {"rows": [], "total": 0, "total_valor": 0.0, "page_safe": 0, "pages": 1, "page_size": int(q.get("page_size", 50) or 50)}
-
-        rows = list(details.get("rows", []) or [])
-        return {
-            "mes_ref": ref,
-            "despesas_total": float(base.get("despesas_total", 0.0) or 0.0),
-            "contas_total": int(base.get("contas_total", 0) or 0),
-            "contas_pagas": int(base.get("contas_pagas", 0) or 0),
-            "valor_pago_total": float(base.get("valor_pago_total", 0.0) or 0.0),
-            "contas_pendentes": int(base.get("contas_pendentes", 0) or 0),
-            "valor_pendente": float(base.get("valor_pendente", 0.0) or 0.0),
-            "contas_vencidas": int(base.get("contas_vencidas", 0) or 0),
-            "valor_vencido": float(base.get("valor_vencido", 0.0) or 0.0),
-            "contas_vencem_hoje": int(base.get("contas_vencem_hoje", 0) or 0),
-            "contas_vencem_7d": int(base.get("contas_vencem_7d", 0) or 0),
-            "daily_series": list(base.get("daily_series", []) or []),
-            "rows": rows,
-            "total": int(details.get("total", len(rows)) or 0),
-            "total_valor": float(details.get("total_valor", 0.0) or 0.0),
-            "page_safe": int(details.get("page_safe", int(q.get("page", 0) or 0)) or 0),
-            "pages": int(details.get("pages", 1) or 1),
-            "page_size": int(details.get("page_size", int(q.get("page_size", 50) or 50)) or 50),
-            "sort_key": str(details.get("sort_key", q.get("sort_key", "data_vencimento")) or "data_vencimento"),
-            "sort_dir": str(details.get("sort_dir", q.get("sort_dir", "asc")) or "asc"),
-            "query": q,
-        }
+        return finance_payload_service.compute_contas_pagar_payload(db, mes_iso, q)
 
     def _apply_contas_pagar_payload(self, payload: dict):
         self._contas_inflight = False
@@ -2519,12 +2358,12 @@ class MainWindow(QMainWindow):
             if ref:
                 self._set_cached_contas_payload(ref, payload or {}, query=(payload or {}).get("query"))
         except Exception:
-            pass
+            logger.debug("Falha ao salvar cache de contas a pagar.", exc_info=True)
         try:
             self.financeiro.set_contas_payload(payload or {})
             self.financeiro.set_contas_loading(False)
         except Exception:
-            pass
+            logger.debug("Falha ao aplicar payload de contas a pagar.", exc_info=True)
         self._schedule_contas_pagar_refresh_if_pending()
 
     # ============================
@@ -3061,7 +2900,141 @@ class MainWindow(QMainWindow):
         ).to_dict()
         self._activity_history.insert(0, entry)
         self._activity_history = self._activity_history[:12]
+        self._append_audit_log(entry)
         self._invalidate_dashboard_cache()
+
+    def _append_audit_log(self, entry: dict):
+        """Persist basic operational audit trail in JSONL (monthly files)."""
+        try:
+            now = datetime.now()
+            audit_dir = db.get_app_data_dir() / "reports" / "auditoria"
+            audit_dir.mkdir(parents=True, exist_ok=True)
+            dst = audit_dir / f"auditoria_{now.strftime('%Y_%m')}.jsonl"
+            payload = {
+                "ts": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "role": str(self._nivel_usuario or "").strip() or "-",
+                "title": str(entry.get("title", "") or ""),
+                "detail": str(entry.get("detail", "") or ""),
+                "level": str(entry.get("level", "") or "info"),
+                "source": str(entry.get("source", "") or "system"),
+            }
+            with dst.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.debug("Falha ao persistir auditoria operacional: %s", exc)
+
+    def _write_renovacao_lote_report(
+        self,
+        *,
+        stage: str,
+        solicitados: list[int],
+        atualizados: list[int],
+        tipo_pdf: str = "",
+        output_dir: str = "",
+        pdf_generated: list[dict] | None = None,
+        pdf_failed: list[dict] | None = None,
+        cancelled: bool = False,
+        extra: dict | None = None,
+    ) -> dict:
+        try:
+            now = datetime.now()
+            reports_dir = db.get_app_data_dir() / "reports" / "renovacoes"
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            stamp = now.strftime("%Y%m%d_%H%M%S")
+            stage_safe = str(stage or "geral").strip().lower().replace(" ", "_")
+            base_name = f"renovacao_{stage_safe}_{stamp}"
+            json_path = reports_dir / f"{base_name}.json"
+            txt_path = reports_dir / f"{base_name}.txt"
+
+            solicitados_set: set[int] = set()
+            for raw in (solicitados or []):
+                try:
+                    value = int(raw)
+                except Exception:
+                    continue
+                if value > 0:
+                    solicitados_set.add(value)
+            solicitados_clean = sorted(solicitados_set)
+
+            atualizados_set: set[int] = set()
+            for raw in (atualizados or []):
+                try:
+                    value = int(raw)
+                except Exception:
+                    continue
+                if value > 0:
+                    atualizados_set.add(value)
+            atualizados_clean = sorted(atualizados_set)
+            gen = list(pdf_generated or [])
+            fail = list(pdf_failed or [])
+
+            payload = {
+                "gerado_em": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "usuario_nivel": str(self._nivel_usuario or "").strip() or "-",
+                "stage": stage_safe,
+                "cancelled": bool(cancelled),
+                "solicitados": solicitados_clean,
+                "atualizados": atualizados_clean,
+                "qtd_solicitados": len(solicitados_clean),
+                "qtd_atualizados": len(atualizados_clean),
+                "tipo_pdf": str(tipo_pdf or "").strip().lower(),
+                "output_dir": str(output_dir or "").strip(),
+                "pdf_generated": gen,
+                "pdf_failed": fail,
+                "extra": dict(extra or {}),
+            }
+            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            lines = [
+                "MEDCONTRACT - RELATORIO DE RENOVACAO EM LOTE",
+                f"Gerado em: {payload['gerado_em']}",
+                f"Usuario/Perfil: {payload['usuario_nivel']}",
+                f"Etapa: {stage_safe}",
+                f"Cancelado: {'SIM' if payload['cancelled'] else 'NAO'}",
+                f"Solicitados: {payload['qtd_solicitados']}",
+                f"Atualizados: {payload['qtd_atualizados']}",
+            ]
+            if payload["tipo_pdf"]:
+                lines.append(f"Tipo PDF: {str(payload['tipo_pdf']).upper()}")
+            if payload["output_dir"]:
+                lines.append(f"Pasta destino: {payload['output_dir']}")
+            if gen or fail:
+                lines.append(f"PDFs gerados: {len(gen)}")
+                lines.append(f"PDFs com falha: {len(fail)}")
+            lines.append("")
+
+            if atualizados_clean:
+                lines.append("CLIENTES ATUALIZADOS (MAT):")
+                lines.append(", ".join(str(v) for v in atualizados_clean))
+                lines.append("")
+
+            if gen:
+                lines.append("PDFS GERADOS:")
+                for item in gen:
+                    mat = int(item.get("mat", 0) or 0)
+                    nome = str(item.get("nome", "") or "").strip() or f"MAT {mat}"
+                    pdf_name = Path(str(item.get("pdf_path", "") or "")).name
+                    lines.append(f"- MAT {mat} | {nome} | {pdf_name}")
+                lines.append("")
+
+            if fail:
+                lines.append("FALHAS:")
+                for item in fail:
+                    mat = int(item.get("mat", 0) or 0)
+                    err = str(item.get("erro", "") or "").strip()
+                    lines.append(f"- MAT {mat} | {err[:220]}")
+                lines.append("")
+
+            txt_path.write_text("\n".join(lines), encoding="utf-8")
+            return {
+                "ok": True,
+                "json_path": str(json_path),
+                "txt_path": str(txt_path),
+                "name": json_path.name,
+            }
+        except Exception as exc:
+            logger.warning("Falha ao gerar relatorio de renovacao em lote: %s", exc)
+            return {"ok": False, "error": _sanitize_error_text(str(exc))}
 
     def _record_export_event(self, action: str, *, ok: bool, path: str = "", error: str = ""):
         when = datetime.now().strftime("%d/%m %H:%M")
@@ -3157,6 +3130,358 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._record_export_event("Autoexport inadimplentes", ok=False, error=str(exc))
             logger.warning("Falha no autoexport recorrente: %s", exc)
+
+    def _auto_cobranca_tick(self):
+        if not _env_flag("MEDCONTRACT_AUTO_COBRANCA_ENABLED", True):
+            return
+        if self._role() != ROLE_ADMIN:
+            return
+        if self._auto_cobranca_inflight:
+            return
+        try:
+            run_hour = int((os.getenv("MEDCONTRACT_AUTO_COBRANCA_HOUR") or "9").strip())
+        except Exception:
+            run_hour = 9
+        run_hour = max(0, min(23, run_hour))
+
+        now = datetime.now()
+        if now.hour < run_hour:
+            return
+
+        day_key = now.strftime("%Y-%m-%d")
+        if self._last_auto_cobranca_key == day_key:
+            return
+
+        self._auto_cobranca_inflight = True
+        worker = _Worker(self._run_daily_auto_cobranca, day_key)
+        self._cobranca_workers.append(worker)
+
+        def _cleanup():
+            self._auto_cobranca_inflight = False
+            try:
+                self._cobranca_workers.remove(worker)
+            except Exception:
+                pass
+
+        def _on_result(result):
+            _cleanup()
+            out = dict(result or {})
+            if bool(out.get("executed", False)):
+                self._last_auto_cobranca_key = day_key
+            total = int(out.get("total_itens", 0) or 0)
+            sent = int(out.get("emails_enviados", 0) or 0)
+            failed = int(out.get("emails_falharam", 0) or 0)
+            send_enabled = bool(out.get("send_email_enabled", False))
+            report_name = str(out.get("report_name", "") or "").strip()
+
+            if total <= 0:
+                self._record_activity(
+                    "Régua de cobrança: sem envios para hoje",
+                    detail=report_name or "Sem pendências na régua D-3/D-1/D0/D+3.",
+                    level="info",
+                    source="automacao",
+                )
+                return
+
+            if send_enabled:
+                level = "success" if failed == 0 else "warn"
+                detail = f"{sent} e-mail(s) enviado(s)"
+                if failed > 0:
+                    detail += f", {failed} falha(s)"
+                if report_name:
+                    detail += f" · {report_name}"
+                self._record_activity(
+                    "Régua de cobrança executada",
+                    detail=detail,
+                    level=level,
+                    source="automacao",
+                )
+            else:
+                detail = f"{total} lembrete(s) gerado(s) sem envio automático"
+                if report_name:
+                    detail += f" · {report_name}"
+                self._record_activity(
+                    "Régua de cobrança gerada",
+                    detail=detail,
+                    level="info",
+                    source="automacao",
+                )
+
+        def _on_error(error_msg: str):
+            _cleanup()
+            msg = str(error_msg or "Falha na régua automática de cobrança.")
+            self._record_activity(
+                "Régua de cobrança falhou",
+                detail=msg,
+                level="warn",
+                source="automacao",
+            )
+            logger.warning("Falha na régua de cobrança: %s", msg)
+
+        worker.signals.result.connect(_on_result)
+        worker.signals.error.connect(_on_error)
+        self._thread_pool.start(worker)
+
+    def _run_daily_auto_cobranca(self, day_key: str) -> dict:
+        """Executa régua D-3/D-1/D0/D+3 para clientes e empresas."""
+        try:
+            ref_date = datetime.strptime(str(day_key or ""), "%Y-%m-%d").date()
+        except Exception:
+            ref_date = datetime.now().date()
+            day_key = ref_date.strftime("%Y-%m-%d")
+
+        mes_iso = ref_date.strftime("%Y-%m")
+        mes_br = iso_to_mes_ref_br(mes_iso).upper()
+        send_email_enabled = _env_flag("MEDCONTRACT_AUTO_COBRANCA_SEND_EMAIL", False)
+
+        stage_map = {
+            3: ("D-3", "Lembrete de vencimento (D-3)"),
+            1: ("D-1", "Lembrete de vencimento (D-1)"),
+            0: ("D0", "Vencimento hoje (D0)"),
+            -3: ("D+3", "Cobrança pós-vencimento (D+3)"),
+        }
+
+        def _money_to_float(v) -> float:
+            if v is None:
+                return 0.0
+            if isinstance(v, (int, float)):
+                return float(v)
+            txt = str(v).strip()
+            if not txt:
+                return 0.0
+            txt = txt.replace("R$", "").replace("r$", "").replace(" ", "")
+            if "," in txt and "." in txt:
+                if txt.rfind(",") > txt.rfind("."):
+                    txt = txt.replace(".", "").replace(",", ".")
+                else:
+                    txt = txt.replace(",", "")
+            elif "," in txt:
+                txt = txt.replace(".", "").replace(",", ".")
+            try:
+                return float(txt)
+            except Exception:
+                return 0.0
+
+        def _wa_url(phone: str) -> str:
+            digits = _only_digits(phone)
+            if not digits:
+                return ""
+            if not digits.startswith("55"):
+                digits = f"55{digits}"
+            return f"https://wa.me/{digits}"
+
+        def _build_msg(item: dict) -> tuple[str, str]:
+            nome = str(item.get("nome", "Cliente") or "Cliente").strip() or "Cliente"
+            valor = float(item.get("valor", 0.0) or 0.0)
+            venc = str(item.get("vencimento_br", "") or "").strip()
+            stage_title = str(item.get("stage_title", "Lembrete de cobrança") or "Lembrete de cobrança")
+            status_legivel = "EM ATRASO" if str(item.get("status", "")).lower() == "em_atraso" else "PENDENTE"
+            wa = str(item.get("whatsapp_url", "") or "").strip()
+            subject = f"{stage_title} · {mes_br} · {nome}"
+            lines = [
+                f"Olá {nome},",
+                "",
+                f"Este é um aviso automático da sua mensalidade de {mes_br}.",
+                f"Valor: {br_money(valor)}",
+                f"Vencimento: {venc}",
+                f"Situação atual: {status_legivel}",
+                "",
+                "Se o pagamento já foi realizado, por favor desconsidere este lembrete.",
+            ]
+            if wa:
+                lines.append(f"WhatsApp para contato: {wa}")
+            lines.extend(["", "MedContract · Automação de Cobrança"])
+            return subject, "\n".join(lines)
+
+        queue: list[dict] = []
+        conn = None
+        try:
+            conn = db.connect()
+            cur = conn.cursor()
+            clientes_pagos_mes = db.cliente_ids_pagamento_mes_cursor(cur, mes_iso)
+            empresas_pagas_mes = db.empresa_ids_pagamento_mes_cursor(cur, mes_iso)
+
+            cur.execute(
+                """
+                SELECT
+                    id, COALESCE(nome, ''), COALESCE(cpf, ''), COALESCE(telefone, ''), COALESCE(email, ''),
+                    COALESCE(vencimento_dia, 10), COALESCE(valor_mensal, 0)
+                FROM clientes
+                WHERE COALESCE(status, 'ativo') <> 'inativo'
+                """
+            )
+            for row in cur.fetchall() or []:
+                cid = int(row[0] or 0)
+                if cid in clientes_pagos_mes:
+                    continue
+                nome = str(row[1] or "").strip() or f"Cliente #{cid}"
+                cpf = str(row[2] or "").strip()
+                telefone = str(row[3] or "").strip()
+                email = str(row[4] or "").strip()
+                venc = max(1, min(31, int(row[5] or 10)))
+                valor = max(0.0, float(row[6] or 0.0))
+                dia = min(venc, int(monthrange(ref_date.year, ref_date.month)[1]))
+                due = ref_date.replace(day=dia)
+                delta = int((due - ref_date).days)
+                if delta not in stage_map:
+                    continue
+                stage_key, stage_title = stage_map[delta]
+                status = db.calcular_status_pagamento(
+                    {"vencimento_dia": venc, "pagamento_mes_atual": False},
+                    hoje=ref_date,
+                )
+                wa = _wa_url(telefone)
+                queue.append(
+                    {
+                        "tipo": "cliente",
+                        "id": cid,
+                        "nome": nome,
+                        "documento": cpf,
+                        "telefone": telefone,
+                        "email": email,
+                        "valor": valor,
+                        "vencimento": due.isoformat(),
+                        "vencimento_br": due.strftime("%d/%m/%Y"),
+                        "status": status,
+                        "stage": stage_key,
+                        "stage_title": stage_title,
+                        "whatsapp_url": wa,
+                    }
+                )
+
+            cur.execute(
+                """
+                SELECT
+                    id, COALESCE(nome, ''), COALESCE(cnpj, ''), COALESCE(telefone, ''), COALESCE(email, ''),
+                    COALESCE(dia_vencimento, 10), COALESCE(valor_mensal, '0')
+                FROM empresas
+                """
+            )
+            for row in cur.fetchall() or []:
+                eid = int(row[0] or 0)
+                if eid in empresas_pagas_mes:
+                    continue
+                nome = str(row[1] or "").strip() or f"Empresa #{eid}"
+                cnpj = str(row[2] or "").strip()
+                telefone = str(row[3] or "").strip()
+                email = str(row[4] or "").strip()
+                venc = max(1, min(31, int(row[5] or 10)))
+                valor = max(0.0, _money_to_float(row[6]))
+                dia = min(venc, int(monthrange(ref_date.year, ref_date.month)[1]))
+                due = ref_date.replace(day=dia)
+                delta = int((due - ref_date).days)
+                if delta not in stage_map:
+                    continue
+                stage_key, stage_title = stage_map[delta]
+                status = db.calcular_status_pagamento(
+                    {"dia_vencimento": venc, "pagamento_mes_atual": False},
+                    hoje=ref_date,
+                )
+                wa = _wa_url(telefone)
+                queue.append(
+                    {
+                        "tipo": "empresa",
+                        "id": eid,
+                        "nome": nome,
+                        "documento": cnpj,
+                        "telefone": telefone,
+                        "email": email,
+                        "valor": valor,
+                        "vencimento": due.isoformat(),
+                        "vencimento_br": due.strftime("%d/%m/%Y"),
+                        "status": status,
+                        "stage": stage_key,
+                        "stage_title": stage_title,
+                        "whatsapp_url": wa,
+                    }
+                )
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+
+        queue.sort(key=lambda r: (str(r.get("stage", "")), str(r.get("nome", ""))))
+
+        emails_enviados = 0
+        emails_falharam = 0
+        sem_email = 0
+
+        if send_email_enabled:
+            for item in queue:
+                to_email = str(item.get("email", "") or "").strip()
+                if not to_email or "@" not in to_email:
+                    sem_email += 1
+                    item["email_status"] = "sem_email"
+                    continue
+                subject, body = _build_msg(item)
+                try:
+                    email_service.send_email(to_email, subject, body)
+                    emails_enviados += 1
+                    item["email_status"] = "enviado"
+                except Exception as exc:
+                    emails_falharam += 1
+                    item["email_status"] = "erro"
+                    item["email_erro"] = _sanitize_error_text(str(exc))
+
+        reports_dir = db.get_app_data_dir() / "reports" / "cobranca_automatica"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = reports_dir / f"cobranca_{day_key}_{stamp}.json"
+        txt_path = reports_dir / f"cobranca_{day_key}_{stamp}.txt"
+
+        payload = {
+            "gerado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "dia_execucao": day_key,
+            "mes_referencia": mes_iso,
+            "send_email_enabled": bool(send_email_enabled),
+            "total_itens": int(len(queue)),
+            "emails_enviados": int(emails_enviados),
+            "emails_falharam": int(emails_falharam),
+            "sem_email": int(sem_email),
+            "itens": queue,
+        }
+        json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        lines = [
+            "MEDCONTRACT - REGUA AUTOMATICA DE COBRANCA",
+            f"Gerado em: {payload['gerado_em']}",
+            f"Execucao: {day_key}",
+            f"Mes referencia: {mes_iso}",
+            f"Itens: {len(queue)}",
+            f"E-mail automatico: {'SIM' if send_email_enabled else 'NAO'}",
+            f"E-mails enviados: {emails_enviados}",
+            f"E-mails falharam: {emails_falharam}",
+            f"Sem e-mail: {sem_email}",
+            "",
+        ]
+        for item in queue:
+            lines.append(
+                f"[{item.get('stage', '-')}] {item.get('tipo', '-').upper()} {item.get('nome', '-')}"
+                f" | venc: {item.get('vencimento_br', '-')}"
+                f" | valor: {br_money(float(item.get('valor', 0.0) or 0.0))}"
+                f" | status: {str(item.get('status', '-') or '-').replace('_', ' ')}"
+                f" | email: {item.get('email_status', 'n/a') if send_email_enabled else 'desativado'}"
+            )
+            wa = str(item.get("whatsapp_url", "") or "").strip()
+            if wa:
+                lines.append(f"  WhatsApp: {wa}")
+        txt_path.write_text("\n".join(lines), encoding="utf-8")
+
+        return {
+            "executed": True,
+            "day_key": day_key,
+            "mes_ref": mes_iso,
+            "total_itens": int(len(queue)),
+            "emails_enviados": int(emails_enviados),
+            "emails_falharam": int(emails_falharam),
+            "sem_email": int(sem_email),
+            "send_email_enabled": bool(send_email_enabled),
+            "report_path": str(json_path),
+            "report_name": json_path.name,
+            "report_txt_path": str(txt_path),
+        }
 
     def exportar_clientes(self):
         if not self._ensure_export_allowed():
@@ -3526,6 +3851,8 @@ class MainWindow(QMainWindow):
                 else:
                     ok, msg, _ = db.salvar_conta_pagar(payload)
                 if not ok:
+                    if hasattr(self.financeiro, "show_contas_error"):
+                        self.financeiro.show_contas_error(str(msg or "Não foi possível salvar a conta."))
                     QMessageBox.warning(self, "Conta a pagar", msg)
                     return
                 self._invalidate_dashboard_cache()
@@ -3537,6 +3864,8 @@ class MainWindow(QMainWindow):
                     force=True,
                     query=(self.financeiro.current_contas_query() if hasattr(self.financeiro, "current_contas_query") else None),
                 )
+                if hasattr(self.financeiro, "show_contas_error"):
+                    self.financeiro.show_contas_error("")
                 QMessageBox.information(self, "Conta a pagar", msg or "Conta salva com sucesso.")
                 return
 
@@ -3546,6 +3875,8 @@ class MainWindow(QMainWindow):
                     return
                 ok, msg, _ = db.marcar_conta_paga(conta_id, data_pagamento_real=datetime.now().strftime("%Y-%m-%d"))
                 if not ok:
+                    if hasattr(self.financeiro, "show_contas_error"):
+                        self.financeiro.show_contas_error(str(msg or "Não foi possível marcar a conta como paga."))
                     QMessageBox.warning(self, "Conta a pagar", msg)
                     return
                 self._invalidate_dashboard_cache()
@@ -3557,6 +3888,8 @@ class MainWindow(QMainWindow):
                     force=True,
                     query=(self.financeiro.current_contas_query() if hasattr(self.financeiro, "current_contas_query") else None),
                 )
+                if hasattr(self.financeiro, "show_contas_error"):
+                    self.financeiro.show_contas_error("")
                 QMessageBox.information(self, "Conta a pagar", msg or "Conta marcada como paga.")
                 return
 
@@ -3566,6 +3899,8 @@ class MainWindow(QMainWindow):
                     return
                 ok, msg = db.excluir_conta_pagar(conta_id)
                 if not ok:
+                    if hasattr(self.financeiro, "show_contas_error"):
+                        self.financeiro.show_contas_error(str(msg or "Não foi possível excluir a conta."))
                     QMessageBox.warning(self, "Conta a pagar", msg)
                     return
                 self._invalidate_dashboard_cache()
@@ -3577,9 +3912,13 @@ class MainWindow(QMainWindow):
                     force=True,
                     query=(self.financeiro.current_contas_query() if hasattr(self.financeiro, "current_contas_query") else None),
                 )
+                if hasattr(self.financeiro, "show_contas_error"):
+                    self.financeiro.show_contas_error("")
                 QMessageBox.information(self, "Conta a pagar", msg or "Conta excluída com sucesso.")
                 return
         except Exception as e:
+            if hasattr(self.financeiro, "show_contas_error"):
+                self.financeiro.show_contas_error(f"Falha ao processar ação: {_sanitize_error_text(str(e))}")
             QMessageBox.critical(self, "Conta a pagar", f"Falha ao processar ação: {_sanitize_error_text(str(e))}")
 
     # ============================
@@ -3601,7 +3940,7 @@ class MainWindow(QMainWindow):
             plano = info.get("plano") or "-"
             deps = int(info.get("dependentes") or 0)
             deps_lista = info.get("dependentes_lista") or []
-            vm = float(info.get("valor_mensal") or 0.0)
+            vm = info.get("valor_mensal")
             ultimo = info.get("ultimo_pagamento")
 
             texto = f"Cliente: {info.get('nome','-')} - Plano: {plano} - Dep: {deps}\nStatus: {status_txt} - Pagamento: {pag_txt}"
@@ -3669,7 +4008,7 @@ class MainWindow(QMainWindow):
             forma_raw = (info.get("forma_pagamento") or "").lower()
             forma_txt = (info.get("forma_pagamento") or "-").replace("_", " ").upper()
             dia_venc = int(info.get("dia_vencimento") or 0)
-            valor = float(info.get("valor_mensal") or 0.0)
+            valor = info.get("valor_mensal")
             ultimo = info.get("ultimo_pagamento")
 
             texto = (
@@ -3787,7 +4126,272 @@ class MainWindow(QMainWindow):
         )
         return str(pdf_path)
 
-    def baixar_contrato_cliente_por_mat(self, mat: int, operation: str = "manual"):
+    def _generate_contracts_pdf_batch_worker(
+        self,
+        mats: list[int],
+        tipo: str,
+        operation: str = "renovacao_lote",
+        output_dir: str | None = None,
+    ) -> dict:
+        from services.contract_service import generate_contract_pdf
+
+        out_dir_path = Path(output_dir).expanduser() if str(output_dir or "").strip() else None
+        ok_items: list[dict] = []
+        failed_items: list[dict] = []
+
+        for raw in (mats or []):
+            try:
+                mat = int(raw)
+            except Exception:
+                continue
+            if mat <= 0:
+                continue
+
+            try:
+                cliente, dependentes = self._load_contract_cliente_data(mat)
+                pdf_path = generate_contract_pdf(
+                    cliente=cliente,
+                    dependentes=dependentes,
+                    contract_type=str(tipo or "boleto").strip().lower(),
+                    operation=operation,
+                    output_dir=out_dir_path,
+                )
+                ok_items.append(
+                    {
+                        "mat": mat,
+                        "nome": str(cliente.get("nome", "") or "").strip() or f"MAT {mat}",
+                        "pdf_path": str(pdf_path),
+                    }
+                )
+            except Exception as exc:
+                failed_items.append(
+                    {
+                        "mat": mat,
+                        "erro": _sanitize_error_text(str(exc)),
+                    }
+                )
+
+        return {
+            "requested": len([int(v) for v in (mats or []) if str(v).strip().isdigit()]),
+            "generated": ok_items,
+            "failed": failed_items,
+            "tipo": str(tipo or "").strip().lower(),
+            "output_dir": str(out_dir_path) if out_dir_path else "",
+        }
+
+    def _generate_contract_pdf_by_mat_worker(
+        self,
+        mat: int,
+        tipo: str,
+        operation: str = "renovacao_lote",
+        output_dir: str | None = None,
+    ) -> dict:
+        mat_i = int(mat)
+        cliente, dependentes = self._load_contract_cliente_data(mat_i)
+        pdf_path = self._generate_contract_pdf_worker(
+            cliente,
+            dependentes,
+            str(tipo or "boleto").strip().lower() or "boleto",
+            operation,
+            output_dir,
+        )
+        return {
+            "mat": mat_i,
+            "nome": str(cliente.get("nome", "") or "").strip() or f"MAT {mat_i}",
+            "pdf_path": str(pdf_path),
+        }
+
+    def _run_contract_pdf_batch_with_progress(
+        self,
+        mats: list[int],
+        tipo: str,
+        output_dir: str | None = None,
+        *,
+        operation: str = "renovacao_lote",
+    ):
+        mats_clean: list[int] = []
+        seen: set[int] = set()
+        for raw in (mats or []):
+            try:
+                value = int(raw)
+            except Exception:
+                continue
+            if value <= 0 or value in seen:
+                continue
+            seen.add(value)
+            mats_clean.append(value)
+
+        if not mats_clean:
+            return
+
+        total = len(mats_clean)
+        progress = QProgressDialog(
+            "Preparando geração em lote...",
+            "Cancelar",
+            0,
+            total,
+            self,
+        )
+        progress.setWindowTitle("Gerando contratos em lote")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.canceled.connect(
+            lambda: progress.setLabelText("Cancelando... finalizando o item atual.")
+        )
+        progress.show()
+
+        state = {
+            "index": 0,
+            "generated": [],
+            "failed": [],
+            "cancelled": False,
+        }
+
+        def _finish():
+            qtd_ok = len(state["generated"])
+            qtd_fail = len(state["failed"])
+            processados = int(state["index"])
+            restantes = max(0, total - processados)
+
+            try:
+                progress.setValue(total)
+            except Exception:
+                pass
+            try:
+                progress.close()
+                progress.deleteLater()
+            except Exception:
+                pass
+
+            if qtd_ok > 0:
+                first_name = Path(str((state["generated"][0] or {}).get("pdf_path", "") or "")).name
+                detail = f"{qtd_ok} PDF(s) em lote"
+                if first_name:
+                    detail = f"{detail} • ex.: {first_name}"
+                self._record_activity(
+                    "PDFs de contratos gerados em lote",
+                    detail=detail,
+                    level="success",
+                    source="contrato",
+                )
+            if qtd_fail > 0:
+                self._record_activity(
+                    "Falha parcial na geracao de PDFs em lote",
+                    detail=f"Falhas: {qtd_fail}",
+                    level="warn",
+                    source="contrato",
+                )
+
+            report_meta = self._write_renovacao_lote_report(
+                stage="pdf",
+                solicitados=list(mats_clean),
+                atualizados=[int((item or {}).get("mat", 0) or 0) for item in state["generated"]],
+                tipo_pdf=str(tipo),
+                output_dir=str(output_dir or ""),
+                pdf_generated=list(state["generated"]),
+                pdf_failed=list(state["failed"]),
+                cancelled=bool(state["cancelled"]),
+                extra={
+                    "processados": int(processados),
+                    "restantes": int(restantes),
+                    "operation": str(operation or "renovacao_lote"),
+                },
+            )
+            if bool(report_meta.get("ok")):
+                self._record_activity(
+                    "Relatorio de renovacao/PDF salvo",
+                    detail=str(report_meta.get("name") or "renovacao_pdf"),
+                    level="success",
+                    source="relatorio",
+                )
+
+            if hasattr(self.listar, "_show_message"):
+                if qtd_fail == 0 and not state["cancelled"]:
+                    self.listar._show_message(f"PDFs gerados com sucesso ({qtd_ok}/{total}).", ok=True, ms=2600)
+                else:
+                    self.listar._show_message(
+                        f"PDFs gerados: {qtd_ok}. Falhas: {qtd_fail}. Restantes: {restantes}.",
+                        ok=False,
+                    )
+
+            resumo = (
+                f"Processados: {processados}/{total}\n"
+                f"PDFs gerados: {qtd_ok}\n"
+                f"Falhas: {qtd_fail}\n"
+                f"Tipo: {str(tipo).upper()}\n"
+                f"Pasta: {str(output_dir or '-').strip() or '-'}"
+            )
+            if state["cancelled"] and restantes > 0:
+                resumo += f"\n\nGeração interrompida pelo usuário. Restantes: {restantes}."
+            if qtd_fail > 0:
+                err_preview = str((state["failed"][0] or {}).get("erro") or "").strip()
+                if err_preview:
+                    resumo += f"\n\nPrimeira falha: {err_preview[:160]}"
+            if bool(report_meta.get("ok")):
+                resumo += f"\n\nRelatorio: {str(report_meta.get('json_path') or '-')}"
+            QMessageBox.information(self, "Geracao de contratos em lote", resumo)
+
+        def _step():
+            if progress.wasCanceled():
+                state["cancelled"] = True
+                _finish()
+                return
+
+            if int(state["index"]) >= total:
+                _finish()
+                return
+
+            idx = int(state["index"])
+            mat = int(mats_clean[idx])
+            progress.setLabelText(f"Gerando contrato {idx + 1}/{total} (MAT {mat})...")
+
+            def _on_item_result(payload: dict, current_mat: int = mat):
+                data = dict(payload or {})
+                if not data.get("mat"):
+                    data["mat"] = int(current_mat)
+                state["generated"].append(data)
+                state["index"] = int(state["index"]) + 1
+                progress.setValue(int(state["index"]))
+                QTimer.singleShot(0, _step)
+
+            def _on_item_error(error_msg: str, current_mat: int = mat):
+                state["failed"].append(
+                    {
+                        "mat": int(current_mat),
+                        "erro": _sanitize_error_text(str(error_msg)),
+                    }
+                )
+                state["index"] = int(state["index"]) + 1
+                progress.setValue(int(state["index"]))
+                QTimer.singleShot(0, _step)
+
+            self._start_tracked_worker(
+                self._generate_contract_pdf_by_mat_worker,
+                int(mat),
+                str(tipo),
+                operation,
+                output_dir,
+                bucket=self._contract_workers,
+                on_result=_on_item_result,
+                on_error=_on_item_error,
+            )
+
+        QTimer.singleShot(0, _step)
+
+    def baixar_contrato_cliente_por_mat(
+        self,
+        mat: int,
+        operation: str = "manual",
+        *,
+        ask_options: bool = True,
+        contract_type: str | None = None,
+        output_dir: str | None = None,
+        show_popup_on_success: bool = True,
+        show_popup_on_error: bool = True,
+    ):
         try:
             mat_i = int(mat)
         except Exception:
@@ -3805,11 +4409,14 @@ class MainWindow(QMainWindow):
             return
 
         default_tipo = self._contract_type_from_forma_pagamento(cliente.get("forma_pagamento", ""))
-        dlg = ContractTypeDialog(self, default_type=default_tipo)
-        if dlg.exec() != QDialog.Accepted:
-            return
-        tipo = dlg.selected_type() or default_tipo
-        output_dir = dlg.selected_output_dir()
+        tipo = str(contract_type or default_tipo or "boleto").strip().lower()
+        final_output_dir = str(output_dir or "").strip()
+        if ask_options:
+            dlg = ContractTypeDialog(self, default_type=default_tipo)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            tipo = dlg.selected_type() or default_tipo
+            final_output_dir = dlg.selected_output_dir()
 
         if hasattr(self.listar, "_show_message"):
             self.listar._show_message(
@@ -3835,7 +4442,8 @@ class MainWindow(QMainWindow):
                 self.listar._show_message("PDF do contrato gerado com sucesso.", ok=True, ms=2200)
             if hasattr(self.cadastro, "_show_message"):
                 self.cadastro._show_message("PDF do contrato gerado com sucesso.", ok=True)
-            QMessageBox.information(self, "Contrato em PDF gerado", ok_msg)
+            if show_popup_on_success:
+                QMessageBox.information(self, "Contrato em PDF gerado", ok_msg)
 
         def _on_error(error_msg: str):
             self._record_activity(
@@ -3849,14 +4457,15 @@ class MainWindow(QMainWindow):
                 self.listar._show_message("Falha ao gerar contrato em PDF.", ok=False)
             if hasattr(self.cadastro, "_show_message"):
                 self.cadastro._show_message("Falha ao gerar contrato em PDF.", ok=False)
-            QMessageBox.critical(self, "Falha ao gerar contrato", msg)
+            if show_popup_on_error:
+                QMessageBox.critical(self, "Falha ao gerar contrato", msg)
         self._start_tracked_worker(
             self._generate_contract_pdf_worker,
             cliente,
             dependentes,
             tipo,
             operation,
-            output_dir,
+            final_output_dir,
             bucket=self._contract_workers,
             on_result=_on_result,
             on_error=_on_error,
@@ -3866,12 +4475,7 @@ class MainWindow(QMainWindow):
     # DB: salvar cliente
     # ============================
     def _salvar_cliente_worker(self, dados: dict) -> dict:
-        ok, msg, cliente_id = cliente_controller.salvar_cliente(dict(dados or {}))
-        return {
-            "ok": bool(ok),
-            "cliente_id": cliente_id,
-            "msg": str(msg or ("Cliente salvo com sucesso." if ok else "Nao foi possivel salvar o cliente.")),
-        }
+        return clientes_service.salvar_cliente(dict(dados or {}))
 
     def salvar_cliente_no_banco(self, dados: dict):
         if self._cliente_save_inflight:
@@ -3939,46 +4543,34 @@ class MainWindow(QMainWindow):
         forma = str(row[16] if len(row) > 16 else "").strip()
         vencimento = str(row[15] if len(row) > 15 else "").strip()
 
-        start_automation = QMessageBox.question(
-            self,
-            "Automação pós-cadastro",
-            "Cliente salvo com sucesso.\n\n"
-            "Deseja iniciar a automação pós-cadastro agora?\n"
-            "• Gerar contrato em PDF\n"
-            "• Enviar e-mail de confirmação",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if start_automation != QMessageBox.Yes:
+        if not self._show_modern_question(
+            title="Automação de pós cadastro",
+            subtitle="Cliente salvo com sucesso.",
+            details=(
+                "Ao confirmar, o sistema irá executar automaticamente:\n"
+                "• geração do contrato em PDF\n"
+                "• envio de e-mail de confirmação"
+            ),
+            confirm_text="Iniciar automação",
+            cancel_text="Agora não",
+        ):
             return
 
-        run_contract = QMessageBox.question(
-            self,
-            "Gerar contrato",
-            f"Deseja gerar agora o contrato em PDF para {nome}?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
+        self.baixar_contrato_cliente_por_mat(
+            int(cliente_id),
+            operation="pos_cadastro",
+            ask_options=False,
+            show_popup_on_success=False,
+            show_popup_on_error=False,
         )
-        if run_contract == QMessageBox.Yes:
-            self.baixar_contrato_cliente_por_mat(int(cliente_id), operation="pos_cadastro")
 
         if not email or "@" not in email:
             if hasattr(self.cadastro, "_show_message"):
                 self.cadastro._show_message(
-                    "Automação: contrato iniciado. E-mail não enviado (cliente sem e-mail válido).",
+                    "Automação iniciada: contrato em geração. E-mail não enviado (cliente sem e-mail válido).",
                     ok=False,
                     ms=2800,
                 )
-            return
-
-        run_email = QMessageBox.question(
-            self,
-            "Enviar e-mail",
-            f"Enviar e-mail de confirmação para {nome} ({email})?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if run_email != QMessageBox.Yes:
             return
 
         subject = "Confirmação de cadastro de contrato"
@@ -3998,8 +4590,16 @@ class MainWindow(QMainWindow):
                 "subject": subject,
                 "body_text": body,
                 "nome": nome,
+                "_silent": True,
+                "_feedback_target": "cadastro",
             }
         )
+        if hasattr(self.cadastro, "_show_message"):
+            self.cadastro._show_message(
+                "Automação iniciada: contrato e e-mail estão sendo processados em segundo plano.",
+                ok=True,
+                ms=3400,
+            )
 
     # ============================
     # DB: empresas
@@ -4045,9 +4645,28 @@ class MainWindow(QMainWindow):
                 self.listar_empresas._show_message(msg, ok=True)
             if hasattr(self.listar_empresas, "reload"):
                 self.listar_empresas.reload()
-            self.ir_para_listar_empresas()
             self._invalidate_dashboard_cache()
             self.atualizar_dashboard_async()
+
+            confirm_text = str(msg or "Empresa cadastrada com sucesso.")
+            should_go_list = self._show_modern_question(
+                title="Cadastro da empresa concluído",
+                subtitle=confirm_text,
+                details=(
+                    "Escolha a próxima ação:\n"
+                    "• Ir para a listagem de empresas\n"
+                    "• Permanecer no cadastro para continuar"
+                ),
+                confirm_text="Ir para listagem",
+                cancel_text="Permanecer aqui",
+            )
+            if should_go_list:
+                self.ir_para_listar_empresas()
+                return
+
+            if modo == "create" and hasattr(self.cadastro_empresa, "set_create_mode"):
+                self.cadastro_empresa.set_create_mode()
+            self.stack.setCurrentWidget(self.cadastro_empresa)
 
         def _err(msg: str):
             if hasattr(self.cadastro_empresa, "erro_salvo"):
@@ -4241,8 +4860,7 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.cadastro)
 
     def _excluir_cliente_worker(self, mat: int) -> dict:
-        ok = db.excluir_cliente(int(mat))
-        return {"ok": bool(ok)}
+        return clientes_service.excluir_cliente(int(mat))
 
     def excluir_cliente_por_mat(self, mat: int):
         # RBAC (Recepção): bloqueio no controlador para impedir exclusão por chamada direta.
@@ -4309,8 +4927,7 @@ class MainWindow(QMainWindow):
         self._thread_pool.start(worker)
 
     def _cancelar_plano_worker(self, mat: int) -> dict:
-        ok, msg = db.cancelar_plano_cliente(int(mat))
-        return {"ok": bool(ok), "msg": str(msg or "")}
+        return clientes_service.cancelar_plano_cliente(int(mat))
 
     def cancelar_plano_cliente_por_mat(self, mat: int):
         if not self._can_edit_cliente():
@@ -4377,47 +4994,274 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(_on_error)
         self._thread_pool.start(worker)
 
-    def _aplicar_reajuste_worker(self, payload: dict) -> dict:
-        try:
-            percentual = float(payload.get("percentual", 0.0) or 0.0)
-        except Exception:
-            percentual = 0.0
-        modo = str(payload.get("modo", "filtros") or "filtros").strip().lower()
-        plano = str(payload.get("plano", "todos") or "todos")
-        somente_ativos = bool(payload.get("somente_ativos", True))
+    def _renovar_contrato_worker(self, mat: int) -> dict:
+        return clientes_service.renovar_contrato_cliente(int(mat))
 
-        if modo == "selecionados":
-            cliente_ids = payload.get("cliente_ids", []) or []
-            ok, msg, info = db.aplicar_reajuste_clientes_selecionados(
-                percentual=percentual,
-                cliente_ids=cliente_ids,
-                somente_ativos=somente_ativos,
-            )
-        elif modo == "individual":
+    def renovar_contrato_cliente_por_mat(self, mat: int):
+        if not self._can_edit_cliente():
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message("Perfil de recepcao nao pode editar clientes.", ok=False)
+            else:
+                self._notify_access_denied("Perfil de recepcao nao pode editar clientes.", popup=True)
+            return
+        if self._renovar_contrato_inflight:
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message("Ja existe uma renovacao em andamento.", ok=False)
+            return
+
+        row = db.buscar_cliente_por_id(int(mat))
+        if not row:
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message("Cliente nao encontrado.", ok=False)
+            return
+        nome = str(row[1] if len(row) > 1 else "").strip() or f"MAT {int(mat)}"
+
+        self._renovar_contrato_inflight = True
+        if hasattr(self.listar, "_show_message"):
+            self.listar._show_message("Renovando contrato...", ok=True)
+
+        worker = _Worker(self._renovar_contrato_worker, int(mat))
+        self._renovar_contrato_workers.append(worker)
+
+        def _cleanup():
+            self._renovar_contrato_inflight = False
             try:
-                cliente_id = int(payload.get("cliente_id", 0) or 0)
+                self._renovar_contrato_workers.remove(worker)
             except Exception:
-                cliente_id = 0
+                pass
+
+        def _on_result(result: dict):
+            _cleanup()
+            ok = bool((result or {}).get("ok"))
+            msg = str((result or {}).get("msg") or "")
+            info = dict((result or {}).get("info") or {})
+
+            if not ok:
+                fail_msg = msg or "Nao foi possivel renovar o contrato."
+                if hasattr(self.listar, "_show_message"):
+                    self.listar._show_message(fail_msg, ok=False)
+                self._record_activity(
+                    "Falha na renovacao de contrato",
+                    detail=f"{nome} (MAT {int(mat)})",
+                    level="warn",
+                    source="clientes",
+                )
+                return
+
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message(msg or "Contrato renovado com sucesso.", ok=True)
+            if hasattr(self.listar, "reload"):
+                self.listar.reload()
+
+            data_inicio_nova = str(info.get("data_inicio_nova") or "").strip()
+            detail = f"{nome} (MAT {int(mat)})"
+            if data_inicio_nova:
+                detail = f"{detail} - inicio {data_inicio_nova}"
+            self._record_activity(
+                "Contrato renovado",
+                detail=detail,
+                level="success",
+                source="clientes",
+            )
+
+            self._invalidate_dashboard_cache()
+            self.atualizar_dashboard_async()
+
+            ask_pdf = QMessageBox.question(
+                self,
+                "Renovacao concluida",
+                f"Contrato renovado para {nome}.\n\nDeseja gerar o novo PDF agora?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ask_pdf == QMessageBox.Yes:
+                self.baixar_contrato_cliente_por_mat(int(mat), operation="renovacao")
+
+        def _on_error(error_msg: str):
+            _cleanup()
+            message = f"Nao foi possivel renovar o contrato: {error_msg}"
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message(message, ok=False)
+            self._record_activity(
+                "Falha na renovacao de contrato",
+                detail=f"{nome} (MAT {int(mat)})",
+                level="warn",
+                source="clientes",
+            )
+
+        worker.signals.result.connect(_on_result)
+        worker.signals.error.connect(_on_error)
+        self._thread_pool.start(worker)
+
+    def _renovar_contratos_lote_worker(self, mats: list[int]) -> dict:
+        return clientes_service.renovar_contratos_clientes(list(mats or []))
+
+    def renovar_contratos_marcados(self, mats: list[int]):
+        if not self._can_edit_cliente():
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message("Perfil de recepcao nao pode editar clientes.", ok=False)
+            else:
+                self._notify_access_denied("Perfil de recepcao nao pode editar clientes.", popup=True)
+            return
+
+        ids_set: set[int] = set()
+        for raw in (mats or []):
             try:
-                novo_valor = float(payload.get("novo_valor", 0.0) or 0.0)
+                value = int(raw)
             except Exception:
-                novo_valor = 0.0
-            ok, msg, info = db.aplicar_reajuste_cliente_especifico(
-                cliente_id=cliente_id,
-                novo_valor=novo_valor,
+                continue
+            if value > 0:
+                ids_set.add(value)
+        ids = sorted(ids_set)
+        if not ids:
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message("Marque ao menos um cliente para renovar.", ok=False)
+            return
+        if self._renovar_lote_inflight:
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message("Ja existe uma renovacao em lote em andamento.", ok=False)
+            return
+
+        self._renovar_lote_inflight = True
+        if hasattr(self.listar, "_show_message"):
+            self.listar._show_message(
+                f"Renovando {len(ids)} contrato(s) em lote...",
+                ok=True,
             )
-        else:
-            ok, msg, info = db.aplicar_reajuste_planos(
-                percentual=percentual,
-                plano=plano,
-                somente_ativos=somente_ativos,
+
+        worker = _Worker(self._renovar_contratos_lote_worker, ids)
+        self._renovar_lote_workers.append(worker)
+
+        def _cleanup():
+            self._renovar_lote_inflight = False
+            try:
+                self._renovar_lote_workers.remove(worker)
+            except Exception:
+                pass
+
+        def _on_result(result: dict):
+            _cleanup()
+            ok = bool((result or {}).get("ok"))
+            msg = str((result or {}).get("msg") or "")
+            info = dict((result or {}).get("info") or {})
+            qtd = int(info.get("clientes_atualizados", 0) or 0)
+            atualizados_ids = []
+            for raw in (info.get("cliente_ids") or ids):
+                try:
+                    value = int(raw)
+                except Exception:
+                    continue
+                if value > 0:
+                    atualizados_ids.append(value)
+            atualizados_ids = sorted(set(atualizados_ids))
+
+            if not ok:
+                fail_msg = msg or "Nao foi possivel renovar os contratos marcados."
+                if hasattr(self.listar, "_show_message"):
+                    self.listar._show_message(fail_msg, ok=False)
+                self._record_activity(
+                    "Falha na renovacao em lote",
+                    detail=f"Solicitados: {len(ids)}",
+                    level="warn",
+                    source="clientes",
+                )
+                return
+
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message(msg or f"Renovacao em lote concluida ({qtd}).", ok=True)
+            if hasattr(self.listar, "_clear_marcados"):
+                try:
+                    self.listar._clear_marcados()
+                except Exception:
+                    pass
+            if hasattr(self.listar, "reload"):
+                self.listar.reload()
+
+            self._record_activity(
+                "Renovacao em lote concluida",
+                detail=f"Atualizados: {qtd} cliente(s)",
+                level="success",
+                source="clientes",
             )
-        return {
-            "ok": bool(ok),
-            "msg": str(msg or ""),
-            "info": dict(info or {}),
-            "modo": modo,
-        }
+            report_meta = self._write_renovacao_lote_report(
+                stage="status",
+                solicitados=list(ids),
+                atualizados=list(atualizados_ids),
+                extra={"qtd_atualizados": int(qtd)},
+            )
+            if bool(report_meta.get("ok")):
+                self._record_activity(
+                    "Relatorio de renovacao salvo",
+                    detail=str(report_meta.get("name") or "renovacao_status"),
+                    level="success",
+                    source="relatorio",
+                )
+            self._invalidate_dashboard_cache()
+            self.atualizar_dashboard_async()
+
+            if qtd <= 0 or not atualizados_ids:
+                return
+
+            ask_pdf = QMessageBox.question(
+                self,
+                "Renovacao em lote concluida",
+                f"{qtd} contrato(s) renovado(s).\n\nDeseja gerar os PDFs agora?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ask_pdf != QMessageBox.Yes:
+                return
+
+            default_tipo = "boleto"
+            try:
+                first_row = db.buscar_cliente_por_id(int(atualizados_ids[0]))
+            except Exception:
+                first_row = None
+            if first_row:
+                try:
+                    default_tipo = self._contract_type_from_forma_pagamento(first_row[16] if len(first_row) > 16 else "")
+                except Exception:
+                    default_tipo = "boleto"
+
+            dlg = ContractTypeDialog(self, default_type=default_tipo)
+            if dlg.exec() != QDialog.Accepted:
+                if hasattr(self.listar, "_show_message"):
+                    self.listar._show_message("Geracao de PDFs cancelada.", ok=False)
+                return
+
+            tipo = dlg.selected_type() or default_tipo
+            output_dir = dlg.selected_output_dir()
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message(
+                    f"Gerando PDFs de {len(atualizados_ids)} contrato(s) renovado(s)...",
+                    ok=True,
+                    ms=2600,
+                )
+            self._run_contract_pdf_batch_with_progress(
+                list(atualizados_ids),
+                str(tipo),
+                output_dir,
+                operation="renovacao_lote",
+            )
+
+        def _on_error(error_msg: str):
+            _cleanup()
+            message = f"Nao foi possivel renovar em lote: {error_msg}"
+            if hasattr(self.listar, "_show_message"):
+                self.listar._show_message(message, ok=False)
+            self._record_activity(
+                "Falha na renovacao em lote",
+                detail=f"Solicitados: {len(ids)}",
+                level="warn",
+                source="clientes",
+            )
+
+        worker.signals.result.connect(_on_result)
+        worker.signals.error.connect(_on_error)
+        self._thread_pool.start(worker)
+
+    def _aplicar_reajuste_worker(self, payload: dict) -> dict:
+        return clientes_service.aplicar_reajuste(dict(payload or {}))
 
     @staticmethod
     def _br_money(v) -> str:
@@ -4520,6 +5364,15 @@ class MainWindow(QMainWindow):
         worker.signals.error.connect(_on_error)
         self._thread_pool.start(worker)
 
+    def _send_email_with_retry_worker(self, to_email: str, subject: str, body_text: str) -> dict:
+        last_error: Exception | None = None
+        for _attempt in (1, 2):
+            try:
+                return email_service.send_email(to_email, subject, body_text)
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"Falha no envio após nova tentativa: {last_error}")
+
     def enviar_email_cliente(self, payload: dict):
         # RBAC (Recepção): bloqueio no controlador para impedir envio por chamada direta.
         if self._role() == ROLE_RECEPCAO:
@@ -4529,65 +5382,58 @@ class MainWindow(QMainWindow):
                 self._notify_access_denied("Perfil de recepção não pode enviar e-mails por esta tela.", popup=True)
             return
 
-        to_email = str(payload.get("to_email", "") or "").strip()
-        subject = str(payload.get("subject", "") or "").strip()
-        body_text = str(payload.get("body_text", "") or "").strip()
-        nome = str(payload.get("nome", "") or "").strip()
+        data = dict(payload or {})
+        to_email = str(data.get("to_email", "") or "").strip()
+        subject = str(data.get("subject", "") or "").strip()
+        body_text = str(data.get("body_text", "") or "").strip()
+        nome = str(data.get("nome", "") or "").strip()
+        silent = bool(data.get("_silent"))
+        feedback_target = str(data.get("_feedback_target", "listar") or "listar").strip().lower()
+
+        def _notify(text: str, ok: bool):
+            msg = str(text or "").strip()
+            if silent and ok:
+                return
+            if feedback_target == "cadastro" and hasattr(self.cadastro, "_show_message"):
+                self.cadastro._show_message(msg, ok=ok)
+            elif hasattr(self.listar, "_show_message"):
+                self.listar._show_message(msg, ok=ok)
+            elif hasattr(self.cadastro, "_show_message"):
+                self.cadastro._show_message(msg, ok=ok)
 
         try:
-            cfg = email_service.load_smtp_config()
-            missing: list[str] = []
-            if not str(cfg.host or "").strip():
-                missing.append("MEDCONTRACT_SMTP_HOST")
-            if not int(cfg.port or 0):
-                missing.append("MEDCONTRACT_SMTP_PORT")
-            if not str(cfg.from_email or "").strip():
-                missing.append("MEDCONTRACT_SMTP_FROM")
-            if not str(cfg.username or "").strip():
-                missing.append("MEDCONTRACT_SMTP_USER")
-            if not str(cfg.password or ""):
-                missing.append("MEDCONTRACT_SMTP_PASSWORD")
-            if missing:
-                msg = (
-                    "Configuracao de e-mail incompleta no .env.\n\n"
-                    "Preencha: " + ", ".join(missing)
-                )
-                if hasattr(self.listar, "_show_message"):
-                    self.listar._show_message(msg, ok=False)
-                QMessageBox.warning(self, "SMTP nao configurado", msg)
-                return
+            email_service.validate_runtime_smtp_config()
         except Exception as e:
-            msg = f"Nao foi possivel ler configuracao SMTP: {e}"
-            if hasattr(self.listar, "_show_message"):
-                self.listar._show_message(msg, ok=False)
-            QMessageBox.warning(self, "Falha na configuracao", msg)
+            msg = f"Configuracao SMTP invalida: {e}"
+            _notify(msg, ok=False)
+            if not silent:
+                QMessageBox.warning(self, "Falha na configuracao", msg)
             return
 
         if not to_email or "@" not in to_email:
             msg = "E-mail do cliente invalido."
-            if hasattr(self.listar, "_show_message"):
-                self.listar._show_message(msg, ok=False)
-            QMessageBox.warning(self, "E-mail invalido", msg)
+            _notify(msg, ok=False)
+            if not silent:
+                QMessageBox.warning(self, "E-mail invalido", msg)
             return
         if not subject:
             msg = "Assunto do e-mail nao informado."
-            if hasattr(self.listar, "_show_message"):
-                self.listar._show_message(msg, ok=False)
-            QMessageBox.warning(self, "Dados incompletos", msg)
+            _notify(msg, ok=False)
+            if not silent:
+                QMessageBox.warning(self, "Dados incompletos", msg)
             return
         if not body_text:
             msg = "Mensagem do e-mail nao informada."
-            if hasattr(self.listar, "_show_message"):
-                self.listar._show_message(msg, ok=False)
-            QMessageBox.warning(self, "Dados incompletos", msg)
+            _notify(msg, ok=False)
+            if not silent:
+                QMessageBox.warning(self, "Dados incompletos", msg)
             return
 
         target = f"{nome} <{to_email}>" if nome else to_email
-        if hasattr(self.listar, "_show_message"):
-            self.listar._show_message(f"Enviando e-mail para {target}...", ok=True)
+        _notify(f"Enviando e-mail para {target}...", ok=True)
         logger.info("Iniciando envio de e-mail para %s", target)
 
-        worker = _Worker(email_service.send_email, to_email, subject, body_text)
+        worker = _Worker(self._send_email_with_retry_worker, to_email, subject, body_text)
         self._email_workers.append(worker)
 
         def _cleanup_worker():
@@ -4598,16 +5444,15 @@ class MainWindow(QMainWindow):
 
         def _on_result(_result):
             _cleanup_worker()
-            if hasattr(self.listar, "_show_message"):
-                self.listar._show_message(f"E-mail enviado para {target}.", ok=True, ms=3200)
+            _notify(f"E-mail enviado para {target}.", ok=True)
             logger.info("E-mail enviado com sucesso para %s", target)
 
         def _on_error(error_msg: str):
             _cleanup_worker()
             message = str(error_msg or "Falha ao enviar e-mail.")
-            if hasattr(self.listar, "_show_message"):
-                self.listar._show_message(message, ok=False)
-            QMessageBox.critical(self, "Falha no envio de e-mail", message)
+            _notify(message, ok=False)
+            if not silent:
+                QMessageBox.critical(self, "Falha no envio de e-mail", message)
             logger.error("Falha ao enviar e-mail para %s: %s", target, message)
 
         worker.signals.result.connect(_on_result)

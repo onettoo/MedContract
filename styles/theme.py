@@ -15,7 +15,12 @@ def project_root() -> Path:
 
 
 def load_base_qss() -> str:
-    return _read_text(project_root() / "styles" / "base.qss")
+    root = project_root()
+    tokens = _read_text(root / "styles" / "tokens.qss")
+    base = _read_text(root / "styles" / "base.qss")
+    if tokens.strip():
+        return f"{tokens}\n\n{base}"
+    return base
 
 
 def load_optional_qss(*relative_paths: str) -> str:

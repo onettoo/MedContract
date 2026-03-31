@@ -169,7 +169,9 @@ def load_env_files() -> list[tuple[Path, int]]:
 
     for env_path in candidates:
         if env_path.exists():
-            loaded = _load_env_file(env_path, overwrite=False)
+            # .env.local deve sobrescrever .env para credenciais locais.
+            overwrite = env_path.name.lower() == ".env.local"
+            loaded = _load_env_file(env_path, overwrite=overwrite)
             results.append((env_path, loaded))
 
     return results
@@ -430,6 +432,44 @@ def main():
             db.create_default_users(required_if_empty=True)
         else:
             db.create_default_admin()
+        try:
+            alerta_dias_env = str(os.getenv("MEDCONTRACT_CONTAS_ALERTA_DIAS") or "").strip()
+            if alerta_dias_env:
+                out_alerta = db.salvar_contas_alerta_config(alerta_dias_env)
+                if bool(out_alerta.get("ok")):
+                    logging.info(
+                        "Configuração de alertas de contas aplicada por env: dias=%s.",
+                        ",".join(str(v) for v in (out_alerta.get("dias") or [])),
+                    )
+                else:
+                    logging.warning(
+                        "Falha ao aplicar MEDCONTRACT_CONTAS_ALERTA_DIAS: %s",
+                        str(out_alerta.get("erro", "") or "erro desconhecido"),
+                    )
+        except Exception as alert_exc:
+            logging.warning("Falha ao aplicar configuração de alertas de contas no startup: %s", alert_exc)
+        try:
+            force_norm = _env_flag("MEDCONTRACT_FORCE_MONTH_REF_NORMALIZE_ON_STARTUP", False)
+            norm_out = db.normalizar_mes_referencia_pagamentos_startup(force=bool(force_norm))
+            if bool(norm_out.get("ok")):
+                if bool(norm_out.get("executed")):
+                    logging.info(
+                        "Normalizacao de mes_referencia no startup concluida: alteracoes=%s, motivo=%s.",
+                        int(norm_out.get("total_alteracoes", 0) or 0),
+                        str(norm_out.get("reason", "") or "scheduled"),
+                    )
+                else:
+                    logging.info(
+                        "Normalizacao de mes_referencia no startup ignorada: %s.",
+                        str(norm_out.get("reason", "already_ran_today") or "already_ran_today"),
+                    )
+            else:
+                logging.warning(
+                    "Falha na normalizacao de mes_referencia no startup: %s",
+                    str(norm_out.get("erro", "erro desconhecido") or "erro desconhecido"),
+                )
+        except Exception as norm_exc:
+            logging.warning("Falha ao executar normalizacao de mes_referencia no startup: %s", norm_exc)
         logging.info("Banco inicializado com sucesso.")
     except Exception as e:
         logging.error("Erro ao inicializar banco: %s", e)
@@ -461,5 +501,4 @@ def main():
     return rc
 
 if __name__ == "__main__":
-    raise SystemExit(main())
- 
+    raise SystemExit(main())    
